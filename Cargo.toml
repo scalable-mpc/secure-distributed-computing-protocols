@@ -10,5 +10,11 @@ members = [
     "consensus",
     # "comm", (WIP: Do not enable unless testing)
     # RBC module
-    "node"
+    "node",
+    # Not reachable from `node`, but listed so that `cargo check --workspace`
+    # keeps them compiling. Both were unbuildable before the commonware switch
+    # (`avid` never declared its `consensus` dependency and `ecc_rbc` pointed at
+    # the wrong path for it), so nothing caught them drifting.
+    "dissemination/avid",
+    "broadcast/ecc_rbc"
 ]

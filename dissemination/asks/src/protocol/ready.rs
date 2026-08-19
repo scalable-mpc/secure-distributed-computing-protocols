@@ -1,5 +1,5 @@
-use consensus::reconstruct_data;
-use crypto::{hash::{Hash, do_hash}, aes_hash::MerkleTree, LargeField};
+use consensus::CheckedShard;
+use crypto::{hash::Hash, LargeField};
 use ctrbc::CTRBCMsg;
 use types::Replica;
 
@@ -21,22 +21,29 @@ impl Context{
             // RBC Context already terminated, skip processing this message
         }
         // check if verifies
-        if !ctrbc_msg.verify_mr_proof(&self.hash_context) {
-            log::error!(
-                "Invalid Merkle Proof sent by node {}, abandoning RBC",
-                ready_sender
-            );
-            return;
-        }
+        let checked_shard = match ctrbc_msg.verify(ready_sender, self.num_nodes, self.num_faults) {
+            Some(shard) => shard,
+            None => {
+                log::error!(
+                    "Invalid shard sent by node {}, abandoning RBC",
+                    ready_sender
+                );
+                return;
+            }
+        };
 
-        let root = ctrbc_msg.mp.root();
+        let root = ctrbc_msg.commitment;
+        if ready_sender == self.myid {
+            // Our own shard, verified above.
+            asks_context.rbc_state.fragment = Some((root, ctrbc_msg.shard.clone()));
+        }
         let ready_senders = asks_context.rbc_state.readys.entry(root).or_default();
 
         if ready_senders.contains_key(&ready_sender){
             return;
         }
 
-        ready_senders.insert(ready_sender, ctrbc_msg.shard);
+        ready_senders.insert(ready_sender, checked_shard);
 
         let size = ready_senders.len().clone();
 
@@ -52,67 +59,82 @@ impl Context{
                 return;
             }
 
-            let ready_senders = ready_senders.clone();
+            // Reconstruct the commitment vector from the verified READY shards.
+            let checked: Vec<CheckedShard> = ready_senders.values().cloned().collect();
+            let data_shards = self.num_nodes - 2 * self.num_faults;
+            let parity_shards = 2 * self.num_faults;
+            let cached = asks_context
+                .rbc_state
+                .fragment
+                .as_ref()
+                .filter(|(commitment, _)| *commitment == root)
+                .map(|(_, shard)| shard.clone());
 
-            // Reconstruct the entire Merkle tree
-            let mut shards:Vec<Option<Vec<u8>>> = Vec::new();
-            for rep in 0..self.num_nodes{
-                
-                if ready_senders.contains_key(&rep){
-                    shards.push(Some(ready_senders.get(&rep).unwrap().clone()));
+            let (message, my_share) = match cached {
+                Some(shard) => {
+                    match consensus::decode(&root, checked.iter(), data_shards, parity_shards) {
+                        Ok(message) => (message, shard),
+                        Err(error) => {
+                            log::error!("FATAL: Error reconstructing the ASKS commitment vector: {}", error);
+                            return;
+                        }
+                    }
                 }
-
-                else{
-                    shards.push(None);
+                None => {
+                    match consensus::decode_with_shards(
+                        &root,
+                        checked.iter(),
+                        data_shards,
+                        parity_shards,
+                    ) {
+                        Ok((message, shards)) => (message, shards[self.myid].clone()),
+                        Err(error) => {
+                            log::error!("FATAL: Error reconstructing the ASKS commitment vector: {}", error);
+                            return;
+                        }
+                    }
                 }
-            }
+            };
 
-            let status = reconstruct_data(&mut shards, self.num_nodes-2*self.num_faults , 2*self.num_faults);
-            
-            if status.is_err(){
-                log::error!("FATAL: Error in Lagrange interpolation {}",status.err().unwrap());
-                return;
-            }
+            let my_checked_share = match consensus::check(
+                &root,
+                self.myid,
+                &my_share,
+                data_shards,
+                parity_shards,
+            ) {
+                Ok(shard) => shard,
+                Err(error) => {
+                    log::error!("FATAL: Re-encoded shard failed its own verification: {}", error);
+                    return;
+                }
+            };
 
-            let shards:Vec<Vec<u8>> = shards.into_iter().map(| opt | opt.unwrap()).collect();
-            
-            let mut message = Vec::new();
-            for i in 0..self.num_nodes-2*self.num_faults{
-                message.extend(shards.get(i).clone().unwrap());
-            }
+            // Ready phase is completed. Save our share for later purposes and quick access.
+            asks_context.rbc_state.fragment = Some((root, my_share.clone()));
 
-            let my_share:Vec<u8> = shards[self.myid].clone();
-            
-            // Reconstruct Merkle Root
-            let hashes_rbc: Vec<Hash> = shards
-            .into_iter()
-            .map(|x| do_hash(x.as_slice()))
-            .collect();
+            asks_context.rbc_state.message = Some(message.clone());
 
-            let merkle_tree = MerkleTree::new(hashes_rbc, &self.hash_context);            
-            
-            if merkle_tree.root() == root{
-                
-                // Ready phase is completed. Save our share for later purposes and quick access. 
-                asks_context.rbc_state.fragment = Some((my_share.clone(),merkle_tree.gen_proof(self.myid)));
+            let deser_root_vec: Vec<Hash> = match bincode::deserialize(&message) {
+                Ok(roots) => roots,
+                Err(error) => {
+                    log::error!("FATAL: Reconstructed ASKS message is not a root vector: {}", error);
+                    return;
+                }
+            };
+            asks_context.roots = Some(deser_root_vec);
+            // Insert own ready share
+            asks_context.rbc_state.readys.get_mut(&root).unwrap().insert(self.myid, my_checked_share);
+            // Send ready message
+            let ctrbc_msg = CTRBCMsg{
+                shard: my_share,
+                commitment: root,
+                origin: ctrbc_msg.origin,
+            };
 
-                asks_context.rbc_state.message = Some(message.clone());
+            let ready_msg = ProtMsg::Ready(ctrbc_msg.clone(), reconstruct_to_all, instance_id);
 
-                let deser_root_vec: Vec<Hash> = bincode::deserialize(&message).unwrap();
-                asks_context.roots = Some(deser_root_vec);
-                // Insert own ready share
-                asks_context.rbc_state.readys.get_mut(&root).unwrap().insert(self.myid, my_share.clone());
-                // Send ready message
-                let ctrbc_msg = CTRBCMsg{
-                    shard: my_share,
-                    mp: merkle_tree.gen_proof(self.myid),
-                    origin: ctrbc_msg.origin,
-                };
-                
-                let ready_msg = ProtMsg::Ready(ctrbc_msg.clone(), reconstruct_to_all, instance_id);
-
-                self.broadcast(ready_msg).await;
-            }
+            self.broadcast(ready_msg).await;
         }
         else if size >= self.num_nodes - self.num_faults && !asks_context.rbc_state.terminated {
             log::info!("Received n-f READY messages for RBC Instance ID {}, terminating",instance_id);

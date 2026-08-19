@@ -20,7 +20,12 @@ serde_json = "1.0" # For JSON serialization
 log="*"
 priority-queue="1"
 fnv = "1"
-reed-solomon-erasure = "4.0"
+# Erasure coding: commonware's SIMD Reed-Solomon (Leopard-RS over GF(2^16))
+# with Merkle commitments and per-shard inclusion proofs. See src/reed_solomon.rs.
+commonware-coding = "2026.7.0"
+commonware-cryptography = "2026.7.0"
+commonware-parallel = "2026.7.0"
+commonware-codec = "2026.7.0"
 num-traits = "0.2.19"
 
 
@@ -42,3 +47,5 @@ lambdaworks-math = "0.11.0"
 
 # Data parallelism
 rayon = "=1.10.0"
+[dev-dependencies]
+bincode = "1"

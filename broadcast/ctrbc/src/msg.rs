@@ -1,23 +1,44 @@
-use crypto::aes_hash::{HashState, Proof};
-
-use crypto::hash::{do_hash};
+use consensus::{CheckedShard, Commitment, Shard};
 use serde::{Deserialize, Serialize};
 
-use types::{Replica};
+use types::Replica;
 
+/// One party's fragment of a broadcast message.
+///
+/// The shard carries its own Merkle inclusion proof against `commitment`, so
+/// the pair is self-describing: given the index the shard is claimed to sit at,
+/// [`CTRBCMsg::verify`] both authenticates the shard and pins it to that
+/// position.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CTRBCMsg {
-    pub shard: Vec<u8>,
-    pub mp: Proof,
+    pub shard: Shard,
+    pub commitment: Commitment,
     pub origin: Replica,
 }
 
 impl CTRBCMsg {
-    pub fn verify_mr_proof(&self, hf: &HashState) -> bool {
-        // 2. Validate Merkle Proof
-        let hash_of_shard: [u8; 32] = do_hash(&self.shard.as_slice());
-        let state: bool = hash_of_shard == self.mp.item().clone() && self.mp.validate(hf);
-        return state;
+    /// Check the shard against the commitment at `index`, returning the
+    /// verified shard on success.
+    ///
+    /// `index` is the position the shard is expected to occupy, which in every
+    /// phase is the identity of the node that sent it (for INIT, the receiver's
+    /// own identity, since the dealer sends each node its own shard). A shard
+    /// verifies at exactly one index, so passing the sender's identity here is
+    /// what stops a node from replaying somebody else's fragment.
+    pub fn verify(
+        &self,
+        index: Replica,
+        num_nodes: usize,
+        num_faults: usize,
+    ) -> Option<CheckedShard> {
+        consensus::check(
+            &self.commitment,
+            index,
+            &self.shard,
+            num_nodes - 2 * num_faults,
+            2 * num_faults,
+        )
+        .ok()
     }
 }
 /*

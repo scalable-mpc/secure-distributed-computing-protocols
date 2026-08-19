@@ -1,4 +1,3 @@
-use consensus::get_shards;
 use crypto::{LargeField, hash::{do_hash, Hash}, encrypt, decrypt, aes_hash::{MerkleTree, Proof}, rand_field_element};
 use ctrbc::CTRBCMsg;
 use network::{plaintcp::CancelHandler, Acknowledgement};
@@ -125,13 +124,25 @@ impl Context{
         
         // Start Echo and Ready phases of broadcast
         // Broadcast commitment
+        //
+        // Every honest node derives the same `roots` vector from the dealer's
+        // shares, and commonware's encoding is deterministic, so they all
+        // arrive at the same commitment and the same shards without any
+        // coordination.
         let comm_ser = bincode::serialize(&roots).unwrap();
-        let shards = get_shards(comm_ser, self.num_nodes-2*self.num_faults, 2*self.num_faults);
-        let shard_hashes = shards.iter().map(|shard| do_hash(shard.as_slice())).collect();
+        let (commitment, shards) = match consensus::encode(
+            &comm_ser,
+            self.num_nodes - 2 * self.num_faults,
+            2 * self.num_faults,
+        ) {
+            Ok(encoding) => encoding,
+            Err(error) => {
+                log::error!("Failed to erasure code the ASKS commitment vector: {}", error);
+                return;
+            }
+        };
 
-        let mt = MerkleTree::new(shard_hashes, &self.hash_context);
-
-        new_asks_state.verified_hash = Some(mt.root());
+        new_asks_state.verified_hash = Some(commitment);
         new_asks_state.echo_sent = true;
         // Send ECHOs now
         for rep in 0..self.num_nodes{
@@ -139,7 +150,7 @@ impl Context{
 
             let rbc_msg = CTRBCMsg{
                 shard: shards[self.myid].clone(),
-                mp: mt.gen_proof(self.myid),
+                commitment: commitment,
                 origin: sender,
             };
 

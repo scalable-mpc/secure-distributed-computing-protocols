@@ -5,7 +5,7 @@ use std::{
 
 use config::Node;
 
-use ctrbc::RBCState;
+use crate::protocol::RAState;
 use fnv::FnvHashMap;
 use network::{
     plaintcp::{CancelHandler, TcpReceiver, TcpReliableSender},
@@ -54,7 +54,7 @@ pub struct Context {
     pub nonce_seed: usize,
 
     /// State for ACSS
-    pub ra_state: HashMap<usize, RBCState>,
+    pub ra_state: HashMap<usize, RAState>,
 
     /// Input and output request channels
     pub inp_ra_requests: Receiver<(usize,usize, usize)>,

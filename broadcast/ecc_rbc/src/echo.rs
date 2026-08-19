@@ -1,6 +1,6 @@
 use crypto::hash::{do_hash, Hash};
-use reed_solomon_rs::fec::fec::*;
 
+use crate::msg::Share;
 use super::{Context, ShareMsg, ProtMsg};
 use types::WrapperMsg;
 
@@ -17,29 +17,24 @@ impl Context {
     pub async fn start_echo(self: &mut Context, msg_content: Vec<u8>) {
         let hash = do_hash(&msg_content);
 
-        let f = match FEC::new(self.num_faults, self.num_nodes) {
-            Ok(f) => f,
-            Err(e) => {
-                log::info!("FEC initialization failed with error: {:?}", e);
+        // t+1 fragments reconstruct the message, so a t-degree polynomial over
+        // `num_faults` data shards and the rest recovery.
+        let shards = match consensus::raw::get_shards(
+            msg_content,
+            self.num_faults,
+            self.num_nodes - self.num_faults,
+        ) {
+            Ok(shards) => shards,
+            Err(error) => {
+                log::info!("Encoding failed with error: {}", error);
                 return;
             }
         };
-        let mut shares: Vec<Share> = vec![
-            Share {
-                number: 0,
-                data: vec![]
-            };
-            self.num_nodes
-        ];
-        {
-            let output = |s: Share| {
-                shares[s.number] = s.clone(); // deep copy
-            };
-            if let Err(e) = f.encode(&msg_content, output) {
-                log::info!("Encoding failed with error: {:?}", e);
-            }
-            //f.encode(&msg_content, output)?;
-        }
+        let shares: Vec<Share> = shards
+            .into_iter()
+            .enumerate()
+            .map(|(number, data)| Share { number, data })
+            .collect();
 
         self.fragment = shares[self.myid].clone();
 

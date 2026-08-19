@@ -1,5 +1,5 @@
+use crate::msg::Share;
 use crypto::hash::Hash;
-use reed_solomon_rs::fec::fec::*;
 use std::collections::{HashMap, HashSet};
 
 #[derive(PartialEq, Debug)]

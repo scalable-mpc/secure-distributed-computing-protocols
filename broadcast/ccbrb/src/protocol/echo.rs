@@ -1,11 +1,10 @@
-use crate::msg::{EchoMsg, SendMsg};
+use crate::msg::{EchoMsg, SendMsg, Share};
 
 use crate::Status;
 use crate::{Context, ProtMsg};
 use bincode;
 use crypto::hash::{do_hash};
 use network::{plaintcp::CancelHandler, Acknowledgement};
-use reed_solomon_rs::fec::fec::*;
 use types::WrapperMsg;
 
 impl Context {
@@ -19,39 +18,27 @@ impl Context {
                                                                   //     d_hashes
                                                                   // );
 
-        let f = match FEC::new(self.num_faults, self.num_nodes) {
-            Ok(f) => f,
-            Err(e) => {
-                log::info!("FEC initialization failed with error: {:?}", e);
+        // Erasure code D itself, so that a node which never receives the hash
+        // vector can still reconstruct it from t+1 fragments. This coding needs
+        // no commitment of its own: the reconstruction is checked against `c`.
+        assert!(d_hashes.len() > 0, "Message content is empty");
+        let serialized_hashes = bincode::serialize(&d_hashes).unwrap();
+        let pi_shards = match consensus::raw::get_shards(
+            serialized_hashes,
+            self.num_faults,
+            self.num_nodes - self.num_faults,
+        ) {
+            Ok(shards) => shards,
+            Err(error) => {
+                log::info!("Encoding of the hash vector failed: {}", error);
                 return;
             }
         };
-
-        let mut pi: Vec<Share> = vec![
-            Share {
-                number: 0,
-                data: vec![]
-            };
-            self.num_nodes
-        ];
-        {
-            let output = |s: Share| {
-                pi[s.number] = s.clone(); // deep copy
-            };
-            // log::info!(
-            //     "d_hashes before encoding: {:?}, instance_id: {}",
-            //     d_hashes,
-            //     instance_id
-            // );
-            assert!(d_hashes.len() > 0, "Message content is empty");
-            // let encoded: Vec<u8> = d_hashes.iter().flatten().copied().collect();
-            let serialized_hashes = bincode::serialize(&d_hashes).unwrap();
-
-            if let Err(e) = f.encode(&serialized_hashes, output) {
-                log::info!("Encoding failed with error: {:?}", e);
-            }
-            //f.encode(&msg_content, output)?;
-        }
+        let mut pi: Vec<Share> = pi_shards
+            .into_iter()
+            .enumerate()
+            .map(|(number, data)| Share { number, data })
+            .collect();
         if self.byz {
             // if byzantine, set all shares to empty, but make sure to keep the size consistent, so fill with 0
             for i in 0..self.num_nodes {
