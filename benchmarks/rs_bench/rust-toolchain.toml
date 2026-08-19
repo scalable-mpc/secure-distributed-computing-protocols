@@ -1,0 +1,5 @@
+[toolchain]
+# commonware-coding 2026.7.0 pulls transitive deps requiring rustc >= 1.89,
+# while the rest of the repository builds on 1.88. This pin applies only to
+# this directory.
+channel = "1.97.1"
