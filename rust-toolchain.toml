@@ -1,0 +1,5 @@
+[toolchain]
+# commonware 2026.7.0 (pulled in by `consensus` for Reed-Solomon coding) requires
+# rustc >= 1.89 via its `crc-fast` dependency. The rest of the workspace builds
+# unchanged on this toolchain.
+channel = "1.97.1"

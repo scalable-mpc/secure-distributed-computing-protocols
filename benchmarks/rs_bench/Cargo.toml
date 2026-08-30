@@ -1,0 +1,43 @@
+[workspace]
+
+[package]
+name = "rs_bench"
+version = "0.1.0"
+authors = ["akhilsb <akhilsai2712@gmail.com>"]
+edition = "2021"
+publish = false
+
+# This crate declares its own `[workspace]` on purpose: `commonware-*` needs a
+# much newer rustc than the rest of the repository builds with, so it is kept
+# out of the root workspace and pinned to its own toolchain via
+# `rust-toolchain.toml`. Nothing in the main build depends on it.
+
+[dependencies]
+# --- stack A: what this repository uses today -------------------------------
+# `src/repo.rs` compiles `consensus/src/reed_solomon.rs` directly via #[path],
+# so the benchmark measures the real code rather than a copy of it.
+reed-solomon-erasure = "4.0"
+crypto = { package = "crypto", path = "../../crypto" }
+log = "*"
+
+# --- stack B: commonware ----------------------------------------------------
+commonware-coding = "2026.7.0"
+commonware-cryptography = "2026.7.0"
+commonware-parallel = "2026.7.0"
+commonware-utils = "2026.7.0"
+commonware-codec = "2026.7.0"
+
+bytes = "1"
+rand = "0.8"
+
+[dev-dependencies]
+criterion = { version = "0.7", features = ["html_reports"] }
+
+[[bench]]
+name = "reed_solomon"
+harness = false
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

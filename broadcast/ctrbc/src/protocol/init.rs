@@ -1,8 +1,3 @@
-use consensus::get_shards;
-use crypto::{
-    aes_hash::{MerkleTree, HashState},
-    hash::{do_hash, Hash},
-};
 use types::{WrapperMsg};
 
 use crate::{Context};
@@ -10,25 +5,45 @@ use crate::{CTRBCMsg, ProtMsg};
 use network::{plaintcp::CancelHandler, Acknowledgement};
 
 impl Context {
+    /// Number of data shards and parity shards this broadcast codes with.
+    ///
+    /// `n = 3f + 1` shards in total, of which any `n - 2f` reconstruct the
+    /// message, so the protocol tolerates the `2f` shards that crashed or
+    /// Byzantine nodes may withhold.
+    pub(crate) fn coding_split(&self) -> (usize, usize) {
+        (
+            self.num_nodes - 2 * self.num_faults,
+            2 * self.num_faults,
+        )
+    }
+
     // Dealer sending message to everybody
     pub async fn start_init(self: &mut Context, msg:Vec<u8>, instance_id:usize) {
-        let shards = get_shards(msg, self.num_nodes-2*self.num_faults, 2*self.num_faults);
-        
-        let merkle_tree = construct_merkle_tree(shards.clone(),&self.hash_context);
-        
+        let (data_shards, parity_shards) = self.coding_split();
+        // The dealer codes one message here, so this is the one call site that
+        // hands commonware a rayon pool: there is no batch to spread across
+        // cores, only the single encode to split up. Receivers stay sequential.
+        let (commitment, shards) = match consensus::encode(&msg, data_shards, parity_shards) {
+            Ok(encoding) => encoding,
+            Err(error) => {
+                log::error!("Failed to erasure code the broadcast message: {}", error);
+                return;
+            }
+        };
+
         let sec_key_map = self.sec_key_map.clone();
         for (replica, sec_key) in sec_key_map.into_iter() {
-            
+
             let ctrbc_msg = CTRBCMsg {
                 shard: shards[replica].clone(),
-                mp: merkle_tree.gen_proof(replica),
+                commitment: commitment,
                 origin: self.myid,
             };
-            
+
             if replica == self.myid {
                 self.handle_init(ctrbc_msg,instance_id).await;
-            } 
-            
+            }
+
             else {
                 let protocol_msg = ProtMsg::Init(ctrbc_msg, instance_id);
                 let wrapper_msg = WrapperMsg::new(protocol_msg.clone(), self.myid, &sec_key.as_slice());
@@ -42,23 +57,25 @@ impl Context {
     pub async fn handle_init(self: &mut Context, msg: CTRBCMsg, instance_id:usize) {
         //send echo
         // self.start_echo(msg.content.clone()).await;
-        if !msg.verify_mr_proof(&self.hash_context) {
+        // The dealer sends each node the shard at that node's own index, so
+        // this is the position the shard has to verify at.
+        if msg.verify(self.myid, self.num_nodes, self.num_faults).is_none() {
             log::error!(
-                "Invalid Merkle Proof sent by node {}, abandoning RBC",
+                "Invalid shard sent by node {}, abandoning RBC",
                 msg.origin
             );
             return;
         }
 
         log::debug!(
-            "Received Init message {:?} from node {}.",
-            msg.shard,
+            "Received Init message for commitment {:?} from node {}.",
+            msg.commitment,
             msg.origin,
         );
 
         let ctrbc_msg = CTRBCMsg {
             shard: msg.shard,
-            mp: msg.mp,
+            commitment: msg.commitment,
             origin: msg.origin,
         };
 
@@ -71,13 +88,4 @@ impl Context {
         // Invoke this function after terminating the protocol.
         //self.terminate("1".to_string()).await;
     }
-}
-
-pub fn construct_merkle_tree(shards:Vec<Vec<u8>>, hc: &HashState)->MerkleTree{
-    let hashes_rbc: Vec<Hash> = shards
-        .into_iter()
-        .map(|x| do_hash(x.as_slice()))
-        .collect();
-
-    MerkleTree::new(hashes_rbc, hc)
 }

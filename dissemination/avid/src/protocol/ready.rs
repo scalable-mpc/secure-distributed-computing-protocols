@@ -1,11 +1,10 @@
 use std::collections::{HashMap};
 
-use consensus::reconstruct_data;
+use consensus::CheckedShard;
 use crypto::hash::Hash;
 use types::Replica;
 
 use crate::msg::{AVIDShard};
-use crate::protocol::init::construct_merkle_tree;
 use crate::{AVIDState};
 
 use crate::Context;
@@ -45,58 +44,54 @@ impl Context {
         let shards_map = avid_context.deliveries.get_mut(&root_hash).unwrap();
         if avid_shard.is_some(){
             let avid_shard = avid_shard.unwrap();
-            if avid_shard.verify(&self.hash_context) && (avid_shard.master_proof.root() == root_hash){
-                shards_map.insert(ready_sender, avid_shard);
-            }
-            else{
-                log::error!("Received invalid shard from sender {} in instance_id {} because {} and {}",
-                    ready_sender,
-                    instance_id,
-                    avid_shard.verify(&self.hash_context),
-                    avid_shard.master_proof.root() == root_hash
-                );
-                return;
+            // The forwarding node holds the shard at its own index.
+            let checked = avid_shard.verify(
+                &self.hash_context,
+                ready_sender,
+                self.num_nodes,
+                self.num_faults,
+            );
+            match checked {
+                Some(checked) if avid_shard.master_proof.root() == root_hash => {
+                    shards_map.insert(ready_sender, (avid_shard.commitment, checked));
+                }
+                _ => {
+                    log::error!("Received invalid shard from sender {} in instance_id {}",
+                        ready_sender,
+                        instance_id
+                    );
+                    return;
+                }
             }
         }
 
-        if shards_map.len() == self.num_nodes-2*self.num_faults && avid_context.message.is_none(){
+        if shards_map.len() >= self.num_nodes-2*self.num_faults && avid_context.message.is_none(){
             // Sent ECHOs and getting a ready message for the same ECHO
             log::info!("Received enough messages for interpolating AVID message in instance {} sent by origin {}", instance_id, origin);
-            let mut shards:Vec<Option<Vec<u8>>> = Vec::new();
-            let mut proof_master_root = None;
-            for rep in 0..self.num_nodes{   
-                if shards_map.contains_key(&rep){
-                    let shard = shards_map.get(&rep).unwrap();
-                    if proof_master_root.is_none(){
-                        proof_master_root = Some(shard.master_proof.clone());
-                    }
-                    shards.push(Some(shard.shard.clone()));
+
+            // Reconstruct against the commitment the shards were verified
+            // under. Decoding rejects any shard checked against a different
+            // commitment, so a forwarder that supplies a shard from another
+            // recipient's message makes this fail rather than corrupt the
+            // result — the check the explicit Merkle root comparison performed.
+            let commitment = shards_map.values().next().unwrap().0;
+            let checked: Vec<CheckedShard> =
+                shards_map.values().map(|(_, shard)| shard.clone()).collect();
+
+            let message = match consensus::decode(
+                &commitment,
+                checked.iter(),
+                self.num_nodes - 2 * self.num_faults,
+                2 * self.num_faults,
+            ) {
+                Ok(message) => message,
+                Err(error) => {
+                    log::error!("FATAL: Error reconstructing AVID message for instance id {} from sender {}: {}", instance_id, origin, error);
+                    return;
                 }
-                else{
-                    shards.push(None);
-                }
-            }
-            let status = reconstruct_data(&mut shards, self.num_nodes-2*self.num_faults , 2*self.num_faults);
-            if status.is_err(){
-                log::error!("FATAL: Error in Lagrange interpolation {}",status.err().unwrap());
-                // Do something else here
-                return;
-            }
-            let shards:Vec<Vec<u8>> = shards.into_iter().map(| opt | opt.unwrap()).collect();
-            // Reconstruct Merkle Root
-            let merkle_tree = construct_merkle_tree(shards.clone(), &self.hash_context);
-            if merkle_tree.root() == proof_master_root.unwrap().item(){
-                log::info!("Reconstructed Merkle root and message successfully with validation for instance id {} from sender {}", instance_id, origin);
-                let mut message = Vec::new();
-                for i in 0..self.num_nodes-2*self.num_faults{
-                    message.extend(shards.get(i).clone().unwrap());
-                }
-                avid_context.message = Some(message.clone());
-            }
-            else{
-                log::error!("FATAL: Reconstructed Merkle root and message failed with validation for instance id {} from sender {}", instance_id, origin);
-                return;
-            }
+            };
+            log::info!("Reconstructed message successfully with validation for instance id {} from sender {}", instance_id, origin);
+            avid_context.message = Some(message);
         }
         if ready_senders.len() >= self.num_nodes - self.num_faults && !avid_context.terminated{
             if avid_context.message.is_some(){

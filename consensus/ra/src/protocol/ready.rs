@@ -1,5 +1,5 @@
 use crypto::hash::do_hash;
-use ctrbc::RBCState;
+use crate::protocol::RAState;
 use types::Replica;
 
 use crate::{context::Context, msg::ProtMsg};
@@ -10,7 +10,7 @@ impl Context{
     pub async fn process_ra_ready(&mut self, instance_id: usize, ready_sender: Replica, value: usize){
         if !self.ra_state.contains_key(&instance_id){
             let (_inst, representative_rep) = replica_from_inst_id(self.threshold, instance_id);
-            let ra_context = RBCState::new(representative_rep);
+            let ra_context = RAState::new(representative_rep);
             self.ra_state.insert(instance_id , ra_context);
         }
 

@@ -1,9 +1,10 @@
 use std::collections::{HashMap, HashSet};
 
+use consensus::{CheckedShard, Commitment};
 use crypto::{hash::Hash};
 use types::Replica;
 
-use crate::msg::{AVIDMsg, AVIDShard};
+use crate::msg::AVIDMsg;
 
 pub struct AVIDState{
     pub sender: usize,
@@ -12,7 +13,11 @@ pub struct AVIDState{
     // Only for the recipient
     // deliveries tracked by the root Hash value
     
-    pub deliveries: HashMap<Hash,HashMap<Replica,AVIDShard>>,
+    /// Verified shards for our own message, keyed by the master root they were
+    /// forwarded under and then by the node that forwarded them. The commitment
+    /// is kept alongside because reconstruction happens against it, not against
+    /// the master root.
+    pub deliveries: HashMap<Hash,HashMap<Replica,(Commitment, CheckedShard)>>,
     pub message: Option<Vec<u8>>,
 
     pub echos: (HashMap<Hash, HashSet<usize>>, HashMap<Hash, HashSet<usize>>),

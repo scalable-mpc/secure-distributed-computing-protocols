@@ -1,9 +1,20 @@
 use std::fmt::Debug;
 
 use crypto::hash::Hash;
-use reed_solomon_rs::fec::fec::*;
 use serde::{Deserialize, Serialize};
 use types::{Replica};
+
+/// One indexed fragment of an erasure-coded message.
+///
+/// This protocol commits to the message with a plain hash and reconstructs from
+/// fragments, with no per-fragment proof, so it uses the bare coder in
+/// [`consensus::raw`] rather than the committed layer.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct Share {
+    /// Index of this fragment in the codeword.
+    pub number: usize,
+    pub data: Vec<u8>,
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Msg {

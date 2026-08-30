@@ -1,9 +1,7 @@
-use crate::msg::SendMsg;
+use crate::msg::{SendMsg, Share};
 use crate::Status;
 use crate::{Context, ProtMsg};
-use consensus::get_shards;
 use crypto::hash::do_hash;
-use reed_solomon_rs::fec::fec::Share;
 use types::WrapperMsg;
 
 impl Context {
@@ -21,7 +19,13 @@ impl Context {
         let n = self.num_nodes;
         let k = self.num_faults + 1;
         // d
-        let shards = get_shards(input_msg.clone(), k, n - k);
+        let shards = match consensus::raw::get_shards(input_msg.clone(), k, n - k) {
+            Ok(shards) => shards,
+            Err(error) => {
+                log::error!("Failed to erasure code the broadcast message: {}", error);
+                return;
+            }
+        };
         assert_eq!(shards.len(), n);
 
         // print input message and shards. input message and shards for instance_id:

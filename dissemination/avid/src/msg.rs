@@ -1,37 +1,55 @@
 use std::collections::HashSet;
 
+use consensus::{CheckedShard, Commitment, Shard};
 use crypto::aes_hash::{HashState, Proof};
 
-use crypto::hash::{do_hash, Hash};
+use crypto::hash::Hash;
 use serde::{Deserialize, Serialize};
 
 use types::{Replica};
 
+/// One party's fragment of one recipient's message.
+///
+/// There are two commitment layers. `commitment` is commonware's Merkle root
+/// over the shards of a single recipient's message, and `shard` carries its own
+/// inclusion proof against it. `master_proof` then places that commitment in
+/// the dealer's master tree over all recipients, so a single master root
+/// identifies the whole batch.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AVIDShard{
     pub id: usize,
     pub origin: Replica,
     pub recipient: Replica,
-    pub shard: Vec<u8>,
-    pub proof: Proof,
+    pub shard: Shard,
+    pub commitment: Commitment,
     pub master_proof: Proof,
 }
 
 impl AVIDShard{
-    pub fn verify(&self, hash_state: &HashState)->bool{
-        let hash_of_shard: [u8; 32] = do_hash(self.shard.as_slice());
-        // log::info!("Hash of shard {:?}, 
-        // Hash of shard from proof {:?}, root of proof {:?},
-        // Hash of shard from master proof {:?}", 
-        //     hash_of_shard, 
-        //     self.proof.item(), 
-        //     self.proof.root(),
-        //     self.master_proof.item());
-        return 
-            (hash_of_shard == self.proof.item()) && 
-            self.proof.validate(hash_state) && 
-            (self.proof.root() == self.master_proof.item()) && 
-            self.master_proof.validate(hash_state);
+    /// Verify both layers, returning the verified shard.
+    ///
+    /// `index` is the position the shard is claimed to hold, which is the
+    /// identity of the node that holds it.
+    pub fn verify(
+        &self,
+        hash_state: &HashState,
+        index: Replica,
+        num_nodes: usize,
+        num_faults: usize,
+    ) -> Option<CheckedShard>{
+        // The commitment must be the one the dealer placed in the master tree...
+        if self.master_proof.item() != self.commitment || !self.master_proof.validate(hash_state) {
+            return None;
+        }
+        // ...and the shard must sit at `index` under that commitment.
+        consensus::check(
+            &self.commitment,
+            index,
+            &self.shard,
+            num_nodes - 2 * num_faults,
+            2 * num_faults,
+        )
+        .ok()
     }
 
     pub fn index_from_shard(&self)-> AVIDIndexMsg{
@@ -49,14 +67,25 @@ pub struct AVIDMsg {
 }
 
 impl AVIDMsg {
-    
-    pub fn verify_mr_proofs(&self, hf: &HashState) -> bool {
+
+    /// Verify every shard in the batch.
+    ///
+    /// The dealer sends each node all of the shards that sit at that node's own
+    /// index, one per recipient, so `index` is the receiver's identity for all
+    /// of them. Every shard must also hang off the same master root.
+    pub fn verify_mr_proofs(
+        &self,
+        hf: &HashState,
+        index: Replica,
+        num_nodes: usize,
+        num_faults: usize,
+    ) -> bool {
         let mut state = true;
         // 2. Validate Merkle Proofs
         let mut hashes_vec: HashSet<Hash> = HashSet::default();
 
         for avid_state in self.shards.iter(){
-            state = state&& avid_state.verify(hf);
+            state = state && avid_state.verify(hf, index, num_nodes, num_faults).is_some();
             hashes_vec.insert(avid_state.master_proof.root());
         }
 
@@ -68,25 +97,25 @@ impl AVIDMsg {
         // create concise root
         let mut hash_vec : Vec<u8> = Vec::new();
         for shard in shards.iter(){
-            hash_vec.extend(shard.proof.root());
+            hash_vec.extend(shard.commitment);
         }
-        let root_hash = do_hash(&hash_vec.as_slice());
-        AVIDMsg { 
-            shards: shards, 
-            origin: origin, 
-            concise_root: root_hash 
+        let root_hash = crypto::hash::do_hash(&hash_vec.as_slice());
+        AVIDMsg {
+            shards: shards,
+            origin: origin,
+            concise_root: root_hash
         }
     }
 
     pub fn indices(&self) -> Vec<AVIDIndexMsg>{
-        
+
         let mut index_vec = Vec::new();
         for shard in &self.shards{
             index_vec.push(shard.index_from_shard());
         }
         index_vec
     }
-    
+
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -100,7 +129,7 @@ pub struct AVIDIndexMsg{
 impl AVIDIndexMsg{
 
     pub fn new(avidmsg: &AVIDMsg)-> Vec<AVIDIndexMsg>{
-        
+
         let mut index_msgs = Vec::new();
         for shard in avidmsg.shards.iter(){
             index_msgs.push(AVIDIndexMsg{
@@ -126,7 +155,7 @@ this is how the rbc protocol works
 pub enum ProtMsg {
     // Create your custom types of messages'
     Init(AVIDMsg, usize), // Init
-    // ECHO contains only indices and roots. 
+    // ECHO contains only indices and roots.
     Echo(AVIDIndexMsg,usize),
     // READY contains only indices and roots.
     Ready(Hash, Replica, Option<AVIDShard>,usize),

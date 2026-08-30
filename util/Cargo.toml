@@ -17,3 +17,10 @@ bytes = "1"
 types = {package = "types", path = "../types"}
 tokio-util = {version="0.6", features= ["full"]}
 log = "*"
+
+# Data parallelism. `parallel::compute` hands CPU work to rayon's global pool
+# so tokio workers are never parked on it.
+rayon = "=1.10.0"
+
+[dev-dependencies]
+futures = "0.3"

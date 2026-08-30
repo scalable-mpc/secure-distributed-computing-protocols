@@ -2,7 +2,6 @@ use super::{ProtMsg, ShareMsg};
 use types::WrapperMsg;
 use crypto::hash::Hash;
 use network::{plaintcp::CancelHandler, Acknowledgement};
-use reed_solomon_rs::fec::fec::FEC;
 
 use super::Context;
 impl Context {
@@ -68,21 +67,32 @@ impl Context {
                 if let Some(hash) = max_shares_hash {
                     let shares_for_correction = self.received_readys.get(&hash).unwrap();
                     // TODO: Implement error correction on shares_for_correction
-                    let f = match FEC::new(self.num_faults, self.num_nodes) {
-                        Ok(f) => f,
-                        Err(e) => {
-                            log::info!("FEC initialization failed with error: {:?}", e);
-                            return;
+                    let mut fragments: Vec<Option<Vec<u8>>> = vec![None; self.num_nodes];
+                    for share in shares_for_correction {
+                        if share.number < self.num_nodes {
+                            fragments[share.number] = Some(share.data.clone());
                         }
-                    };
+                    }
                     log::info!("Decoding {:?}", shares_for_correction.to_vec());
-                    match f.decode([].to_vec(), shares_for_correction.to_vec()) {
-                        Ok(data) => {
+                    match consensus::raw::reconstruct_data(
+                        &mut fragments,
+                        self.num_faults,
+                        self.num_nodes - self.num_faults,
+                    ) {
+                        Ok(()) => {
+                            // The first `num_faults` fragments concatenated are
+                            // the message followed by zero padding; this coder
+                            // does not record the original length.
+                            let data: Vec<u8> = fragments[..self.num_faults]
+                                .iter()
+                                .flatten()
+                                .flat_map(|fragment| fragment.iter().copied())
+                                .collect();
                             log::info!("Outputting: {:?}", data);
                             self.done = true;
                         }
-                        Err(e) => {
-                            log::info!("Decoding failed with error: {}", e.to_string());
+                        Err(error) => {
+                            log::info!("Decoding failed with error: {}", error);
                         }
                     }
                     if self.done {

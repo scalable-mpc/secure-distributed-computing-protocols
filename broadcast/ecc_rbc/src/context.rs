@@ -20,7 +20,7 @@ use tokio::sync::{
 // use tokio_util::time::DelayQueue;
 use types::{Replica, SyncMsg, SyncState};
 
-use reed_solomon_rs::fec::fec::*;
+use crate::msg::Share;
 
 use super::{Handler, SyncHandler};
 use super::ProtMsg;

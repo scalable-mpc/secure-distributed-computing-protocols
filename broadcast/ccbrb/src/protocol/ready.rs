@@ -1,12 +1,10 @@
 use crate::{
-    msg::{ProtMsg, ReadyMsg},
+    msg::{ProtMsg, ReadyMsg, Share},
     Context, Status,
 };
 use bincode;
-use consensus::{reconstruct_data};
 use crypto::hash::{do_hash, Hash};
 
-use reed_solomon_rs::fec::fec::{Share, FEC};
 use std::collections::HashSet;
 use types::Replica;
 use types::WrapperMsg;
@@ -182,50 +180,43 @@ impl Context {
                 return;
             }
 
-            let f = FEC::new(self.num_faults, self.num_nodes).unwrap();
-            // log::info!(
-            //     "About to decode D′ for instance_id: {}, c: {:?}, hash_shares: {:?}",
-            //     instance_id,
-            //     msg.c,
-            //     hash_shares.clone()
-            // );
-
-            let mut d_prime = match f.decode(vec![], hash_shares.clone()) {
-                Ok(data) => data,
-                Err(_) => {
-                    log::warn!("Could not reconstruct D′ from hash shares, trying higher error tolerance later");
-                    return;
+            let mut pi_shards: Vec<Option<Vec<u8>>> = vec![None; self.num_nodes];
+            for share in &hash_shares {
+                if share.number < self.num_nodes {
+                    pi_shards[share.number] = Some(share.data.clone());
                 }
-            };
-
-            // while d prime is not empty and the last element is 95, pop the last element
-            while !d_prime.is_empty() && d_prime.last() == Some(&95) {
-                d_prime.pop();
             }
 
-            // log do hash d prime and msg.c
-            // log::info!(
-            //     "D′ decoded for instance_id: {}, c: {:?}, d_prime: {:?}",
-            //     instance_id,
-            //     msg.c,
-            //     &d_prime
-            // );
-            // log::info!(
-            //     "Comparing hash of d prime and msg.c for instance_id: {}, c: {:?}, d_prime: {:?}",
-            //     instance_id,
-            //     msg.c,
-            //     do_hash(&d_prime)
-            // );
+            if let Err(error) = consensus::raw::reconstruct_data(
+                &mut pi_shards,
+                self.num_faults,
+                self.num_nodes - self.num_faults,
+            ) {
+                log::warn!("Could not reconstruct D′ from hash shares: {}", error);
+                return;
+            }
+
+            // The coder pads the last shard with zeroes and does not record the
+            // original length, so the concatenation is D′ followed by an
+            // unknown number of zero bytes. Deserializing and re-serializing
+            // recovers the exact bytes that were hashed into `c`, which the
+            // comparison below depends on.
+            let padded: Vec<u8> = pi_shards[..self.num_faults]
+                .iter()
+                .flatten()
+                .flat_map(|shard| shard.iter().copied())
+                .collect();
 
             // if 𝐻(𝐷′) = 𝑐 then
-            
-            let d_hashes: Vec<Hash> = match bincode::deserialize(&d_prime) {
+
+            let d_hashes: Vec<Hash> = match bincode::deserialize(&padded) {
                 Ok(decoded) => decoded,
                 Err(e) => {
                     log::warn!("Failed to deserialize D′ into d_hashes: {:?}", e);
                     return;
                 }
             };
+            let d_prime = bincode::serialize(&d_hashes).unwrap();
 
             // log::info!(
             //     "after decoding D′ hashes: {:?} for instance_id: {}, c: {:?}",
@@ -233,7 +224,7 @@ impl Context {
             //     instance_id,
             //     msg.c
             // );
-            let valid_hashes: HashSet<Hash> = d_hashes.into_iter().collect();
+            let valid_hashes: HashSet<Hash> = d_hashes.iter().copied().collect();
 
             let data_shares = rbc_context
                 .fragments_data
@@ -266,7 +257,11 @@ impl Context {
             let mut input_shares: Vec<Option<Vec<u8>>> = vec![None; self.num_nodes];
 
             for share in &data_shares {
-                input_shares[share.number] = Some(share.data.clone());
+                // The index arrives over the network, so bound it rather than
+                // indexing straight into the slot vector.
+                if share.number < self.num_nodes {
+                    input_shares[share.number] = Some(share.data.clone());
+                }
             }
             // log::info!(
             //     "Input shares initialized with {:?} slots for instance_id: {}, c: {:?}",
@@ -278,8 +273,8 @@ impl Context {
             let n = self.num_nodes;
             let k = self.num_faults + 1;
 
-            if reconstruct_data(&mut input_shares, k, n - k).is_err() {
-                log::warn!("reconstruct_data failed");
+            if let Err(error) = consensus::raw::reconstruct_data(&mut input_shares, k, n - k) {
+                log::warn!("reconstruct_data failed: {}", error);
                 return;
             }
 
@@ -304,7 +299,7 @@ impl Context {
                 })
                 .collect::<Vec<_>>();
 
-            let d_prime_hashes: Vec<Hash> = bincode::deserialize(&d_prime).unwrap();
+            let d_prime_hashes: Vec<Hash> = d_hashes;
 
             // log::info!(
             //     "Recomputed shards: {:?} for instance_id: {}, c: {:?}",

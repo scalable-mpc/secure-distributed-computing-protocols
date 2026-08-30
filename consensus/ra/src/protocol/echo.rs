@@ -1,5 +1,5 @@
 use crypto::hash::do_hash;
-use ctrbc::RBCState;
+use crate::protocol::RAState;
 use types::Replica;
 
 use crate::{context::Context, msg::ProtMsg};
@@ -8,7 +8,7 @@ impl Context{
     pub async fn init_ra(&mut self, instance_id: usize, representative_rep: Replica, value: usize){
         log::info!("Request to start Reliable Agreement for instance {} corresponding to replica {}", instance_id, representative_rep);
         if !self.ra_state.contains_key(&instance_id){
-            let rbc_context = RBCState::new(representative_rep);
+            let rbc_context = RAState::new(representative_rep);
             self.ra_state.insert(instance_id, rbc_context);
         }
 
@@ -31,7 +31,7 @@ impl Context{
         // Broadcast ECHO message
         if !self.ra_state.contains_key(&instance_id){
             let (_inst, representative_rep) = replica_from_inst_id(self.threshold, instance_id);
-            let rbc_context = RBCState::new(representative_rep);
+            let rbc_context = RAState::new(representative_rep);
             self.ra_state.insert(instance_id, rbc_context);
         }
 

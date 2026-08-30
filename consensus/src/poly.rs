@@ -7,6 +7,7 @@ use rand_chacha::ChaCha20Rng;
 use rand_core::{SeedableRng, RngCore};
 use rayon::prelude::{IntoParallelIterator, ParallelIterator, IntoParallelRefIterator};
 use types::Replica;
+use util::parallel::compute;
 
 use crate::LargeField;
 
@@ -35,7 +36,26 @@ pub fn sample_polynomials_from_prf(
     evaluations
 }
 
+/// Async entry point for [`generate_evaluation_points_blocking`].
+///
+/// Hands the arithmetic to rayon's pool and awaits the result, so the caller's
+/// tokio worker stays free to poll other protocol instances. See
+/// [`util::parallel::compute`].
 pub async fn generate_evaluation_points(
+    evaluations_prf: Vec<Vec<LargeField>>,
+    degree: usize,
+    shares_total: usize,
+) -> (Vec<Vec<LargeField>>, Vec<Polynomial<LargeField>>) {
+    compute(move || generate_evaluation_points_blocking(evaluations_prf, degree, shares_total)).await
+}
+
+/// Runs on the calling thread and uses rayon internally.
+///
+/// Do not call this from a tokio task: the `par_iter` calls below park the
+/// calling thread until the pool is done, which takes a tokio worker — and
+/// every other task sharing it — out of service. Call [`generate_evaluation_points`] instead, or
+/// call this directly if you are already on a rayon worker.
+pub fn generate_evaluation_points_blocking(
     evaluations_prf: Vec<Vec<LargeField>>, 
     degree: usize,
     shares_total: usize,
@@ -66,7 +86,26 @@ pub async fn generate_evaluation_points(
     (evaluations_full,coefficients)
 }
 
+/// Async entry point for [`generate_evaluation_points_opt_blocking`].
+///
+/// Hands the arithmetic to rayon's pool and awaits the result, so the caller's
+/// tokio worker stays free to poll other protocol instances. See
+/// [`util::parallel::compute`].
 pub async fn generate_evaluation_points_opt(
+    evaluations_prf: Vec<Vec<LargeField>>,
+    degree: usize,
+    shares_total: usize,
+) -> (Vec<Vec<LargeField>>, Vec<Polynomial<LargeField>>) {
+    compute(move || generate_evaluation_points_opt_blocking(evaluations_prf, degree, shares_total)).await
+}
+
+/// Runs on the calling thread and uses rayon internally.
+///
+/// Do not call this from a tokio task: the `par_iter` calls below park the
+/// calling thread until the pool is done, which takes a tokio worker — and
+/// every other task sharing it — out of service. Call [`generate_evaluation_points_opt`] instead, or
+/// call this directly if you are already on a rayon worker.
+pub fn generate_evaluation_points_opt_blocking(
     evaluations_prf: Vec<Vec<LargeField>>, 
     degree: usize,
     shares_total: usize,
@@ -105,7 +144,26 @@ pub async fn generate_evaluation_points_opt(
     (evaluations_full,coefficients)
 }
 
+/// Async entry point for [`generate_evaluation_points_fft_blocking`].
+///
+/// Hands the arithmetic to rayon's pool and awaits the result, so the caller's
+/// tokio worker stays free to poll other protocol instances. See
+/// [`util::parallel::compute`].
 pub async fn generate_evaluation_points_fft(
+    secrets: Vec<LargeField>,
+    degree_poly: usize,
+    shares_total: usize,
+) -> (Vec<Vec<LargeField>>, Vec<Polynomial<LargeField>>) {
+    compute(move || generate_evaluation_points_fft_blocking(secrets, degree_poly, shares_total)).await
+}
+
+/// Runs on the calling thread and uses rayon internally.
+///
+/// Do not call this from a tokio task: the `par_iter` calls below park the
+/// calling thread until the pool is done, which takes a tokio worker — and
+/// every other task sharing it — out of service. Call [`generate_evaluation_points_fft`] instead, or
+/// call this directly if you are already on a rayon worker.
+pub fn generate_evaluation_points_fft_blocking(
     secrets: Vec<LargeField>,
     degree_poly: usize,
     shares_total: usize,

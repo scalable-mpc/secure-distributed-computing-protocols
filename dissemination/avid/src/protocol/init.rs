@@ -1,9 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
-use consensus::get_shards;
+use consensus::{Commitment, Shard};
 use crypto::{
-    aes_hash::{MerkleTree, HashState},
-    hash::{do_hash, Hash},
+    aes_hash::MerkleTree,
+    hash::Hash,
 };
 use types::{WrapperMsg, Replica};
 
@@ -25,34 +25,58 @@ impl Context {
         }
         filled_msg_vec.extend(msgs);
         
-        // Each element of the vector is an AVID for sending a message to a single replica
-        let mut avid_tree: Vec<(Replica,Vec<Vec<u8>>,MerkleTree)> = Vec::new(); 
-        let mut roots_agg: Vec<Hash> = Vec::new();
-        
-        for msg in filled_msg_vec{
-            let msg_length = msg.1.len();
-            let msg_with_length_serialized = bincode::serialize(&(msg.1, msg_length)).unwrap();
-            // Get encrypted text itself
-            let shards = get_shards(msg_with_length_serialized, self.num_nodes-2*self.num_faults, 2*self.num_faults);
-            let merkle_tree = construct_merkle_tree(shards.clone(),&self.hash_context);
-            roots_agg.push(merkle_tree.root());
-            avid_tree.push((msg.0,shards,merkle_tree));
+        // Each element of the vector is an AVID for sending a message to a single replica.
+        // Serialize first: the batch encoder takes payloads alone, and each one's
+        // recipient is recovered by position afterwards.
+        let recipients: Vec<Replica> = filled_msg_vec.iter().map(|(party, _)| *party).collect();
+        let payloads: Vec<Vec<u8>> = filled_msg_vec
+            .into_iter()
+            .map(|(_party, msg)| {
+                let msg_length = msg.len();
+                bincode::serialize(&(msg, msg_length)).unwrap()
+            })
+            .collect();
+
+        // `n` independent messages, each coded into `n` shards: the dealer's
+        // dominant cost. Run the batch on rayon, off this actor's tokio worker.
+        let encodings = match consensus::encode_batch_async(
+            payloads,
+            self.num_nodes - 2 * self.num_faults,
+            2 * self.num_faults,
+        )
+        .await
+        {
+            Ok(encodings) => encodings,
+            Err(error) => {
+                log::error!("Failed to erasure code an AVID message: {}", error);
+                return;
+            }
+        };
+
+        let mut avid_tree: Vec<(Replica,Vec<Shard>,Commitment)> = Vec::with_capacity(encodings.len());
+        let mut roots_agg: Vec<Hash> = Vec::with_capacity(encodings.len());
+        for (recipient, (commitment, shards)) in recipients.into_iter().zip(encodings) {
+            roots_agg.push(commitment);
+            avid_tree.push((recipient, shards, commitment));
         }
-        
+
         let master_mt = MerkleTree::new(roots_agg, &self.hash_context);
         let mut party_wise_share_map: HashMap<usize, Vec<AVIDShard>> = HashMap::default();
         for party in 0..self.num_nodes{
             party_wise_share_map.insert(party, Vec::new());
         }
         for (index,tuple) in avid_tree.into_iter().enumerate(){
+            // The proof depends only on `index`, not on the recipient, so it is
+            // generated once per message instead of once per (message, party).
+            let master_proof = master_mt.gen_proof(index);
             for (party,fragment) in (0..self.num_nodes).into_iter().zip(tuple.1.into_iter()){
                 let avid_shard = AVIDShard{
                     id: instance_id,
                     origin: self.myid,
                     recipient: tuple.0.clone(),
                     shard: fragment,
-                    proof: tuple.2.gen_proof(party),
-                    master_proof: master_mt.gen_proof(index),
+                    commitment: tuple.2,
+                    master_proof: master_proof.clone(),
                 };
                 party_wise_share_map.get_mut(&party).unwrap().push(avid_shard);
             }
@@ -79,17 +103,18 @@ impl Context {
 
     pub async fn handle_init(self: &mut Context, msg: AVIDMsg, instance_id:usize) {
         
-        if !msg.verify_mr_proofs(&self.hash_context) {
+        // Every shard the dealer sends us sits at our own index.
+        if !msg.verify_mr_proofs(&self.hash_context, self.myid, self.num_nodes, self.num_faults) {
             log::error!(
-                "Invalid Merkle Proof sent by node {}, abandoning AVID instance",
+                "Invalid shard sent by node {}, abandoning AVID instance",
                 msg.origin
             );
             return;
         }
 
         log::debug!(
-            "Received Init message {:?} from node {}.",
-            msg.shards,
+            "Received Init message with {} shards from node {}.",
+            msg.shards.len(),
             msg.origin,
         );
 
@@ -111,13 +136,4 @@ impl Context {
             self.add_cancel_handler(cancel_handler);
         }        
     }
-}
-
-pub fn construct_merkle_tree(shards:Vec<Vec<u8>>, hc: &HashState)->MerkleTree{
-    let hashes_rbc: Vec<Hash> = shards
-        .into_iter()
-        .map(|x| do_hash(x.as_slice()))
-        .collect();
-
-    MerkleTree::new(hashes_rbc, hc)
 }
