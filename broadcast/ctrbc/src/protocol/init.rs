@@ -20,7 +20,10 @@ impl Context {
     // Dealer sending message to everybody
     pub async fn start_init(self: &mut Context, msg:Vec<u8>, instance_id:usize) {
         let (data_shards, parity_shards) = self.coding_split();
-        let (commitment, shards) = match consensus::encode(&msg, data_shards, parity_shards) {
+        // The dealer codes one message here, so this is the one call site that
+        // hands commonware a rayon pool: there is no batch to spread across
+        // cores, only the single encode to split up. Receivers stay sequential.
+        let (commitment, shards) = match consensus::encode_parallel(&msg, data_shards, parity_shards) {
             Ok(encoding) => encoding,
             Err(error) => {
                 log::error!("Failed to erasure code the broadcast message: {}", error);

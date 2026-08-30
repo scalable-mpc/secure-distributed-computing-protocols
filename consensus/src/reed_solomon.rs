@@ -37,9 +37,11 @@ use std::num::NonZeroU16;
 use commonware_codec::{Decode, Encode};
 use commonware_coding::{CodecConfig, Config, ReedSolomon, Scheme};
 use commonware_cryptography::{sha256::Digest as Sha256Digest, Sha256};
-use commonware_parallel::Sequential;
+use commonware_parallel::{Rayon, Sequential};
 use crypto::hash::Hash;
+use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::sync::OnceLock;
 
 /// The coding scheme every protocol in this repository uses.
 type Coder = ReedSolomon<Sha256>;
@@ -194,6 +196,96 @@ pub fn encode(
     let (commitment, shards) =
         Coder::encode(&config, data, &STRATEGY).map_err(|e| Error::Coding(format!("{:?}", e)))?;
     Ok((commitment.0, shards.into_iter().map(Shard).collect()))
+}
+
+/// The process-wide rayon strategy used by [`encode_parallel`].
+///
+/// Built once. `Rayon::new` constructs its own thread pool, so calling it per
+/// encode would spawn and tear down a pool for every broadcast. `None` means a
+/// pool could not be built, and callers fall back to [`encode`].
+fn parallel_strategy() -> Option<&'static Rayon> {
+    static PARALLEL: OnceLock<Option<Rayon>> = OnceLock::new();
+    PARALLEL
+        .get_or_init(|| Rayon::new(std::thread::available_parallelism().ok()?).ok())
+        .as_ref()
+}
+
+/// [`encode`], with commonware spreading a *single* message's coding across a
+/// rayon pool.
+///
+/// Use this only where a node codes one large message at a time, which is the
+/// dealer in `ctrbc::start_init`. [`encode`] stays [`Sequential`] everywhere
+/// else on purpose: `acs` and `fin_mvba` drive tens of coding instances
+/// concurrently on the tokio runtime, and giving each of those its own pool
+/// oversubscribes the machine rather than speeding any single one up.
+///
+/// Falls back to [`encode`] when no pool can be built.
+pub fn encode_parallel(
+    data: &[u8],
+    data_shards: usize,
+    parity_shards: usize,
+) -> Result<(Commitment, Vec<Shard>), Error> {
+    let Some(strategy) = parallel_strategy() else {
+        return encode(data, data_shards, parity_shards);
+    };
+    let config = config(data_shards, parity_shards)?;
+    let (commitment, shards) =
+        Coder::encode(&config, data, strategy).map_err(|e| Error::Coding(format!("{:?}", e)))?;
+    Ok((commitment.0, shards.into_iter().map(Shard).collect()))
+}
+
+/// Erasure-code a whole batch of independent messages, one per recipient.
+///
+/// This is the dealer's dominant cost in `avid::start_init`: `n` messages, each
+/// coded into `n` shards and committed, so `O(n^2)` shard work per
+/// dissemination. The messages do not depend on each other, so they go straight
+/// onto rayon.
+///
+/// Each individual encode stays [`Sequential`]. The parallelism is *across*
+/// messages, which saturates the pool once rather than nesting a pool inside a
+/// pool.
+///
+/// Results keep input order: `result[i]` belongs to `messages[i]`.
+///
+/// Call [`encode_batch_async`] from async code — this function blocks until the
+/// whole batch is done.
+pub fn encode_batch(
+    messages: &[Vec<u8>],
+    data_shards: usize,
+    parity_shards: usize,
+) -> Result<Vec<(Commitment, Vec<Shard>)>, Error> {
+    // Validate once up front so a bad split is not reported `n` times over.
+    config(data_shards, parity_shards)?;
+    messages
+        .par_iter()
+        .map(|message| encode(message, data_shards, parity_shards))
+        .collect()
+}
+
+/// [`encode_batch`], run on rayon's pool without blocking the caller.
+///
+/// `par_iter` called directly from an `async fn` does not yield: it injects the
+/// job and then parks the calling thread on a latch, so the tokio worker
+/// running that task is unavailable until the whole batch finishes and the
+/// actor's inbox keeps growing behind it. Handing the batch to `rayon::spawn`
+/// and awaiting a oneshot suspends the future instead, leaving the worker free
+/// to drive other tasks.
+pub async fn encode_batch_async(
+    messages: Vec<Vec<u8>>,
+    data_shards: usize,
+    parity_shards: usize,
+) -> Result<Vec<(Commitment, Vec<Shard>)>, Error> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    rayon::spawn(move || {
+        // A send failure only means the receiver was dropped, i.e. the awaiting
+        // task went away; there is nothing to do about it here.
+        let _ = tx.send(encode_batch(&messages, data_shards, parity_shards));
+    });
+    rx.await.unwrap_or_else(|_| {
+        Err(Error::Coding(
+            "the rayon encoding task was dropped before it produced a result".to_string(),
+        ))
+    })
 }
 
 /// Verify `shard` against `commitment` at `index`.
@@ -452,6 +544,87 @@ mod tests {
     fn split(n: usize) -> (usize, usize) {
         let f = (n - 1) / 3;
         (n - 2 * f, 2 * f)
+    }
+
+    /// `encode_parallel` hands commonware a rayon pool instead of `Sequential`.
+    /// The strategy is a scheduling choice, so the shards and the commitment it
+    /// produces must be byte-identical to the sequential ones.
+    #[test]
+    fn parallel_encoding_matches_sequential_encoding() {
+        for n in [4usize, 7, 16, 64] {
+            let (k, m) = split(n);
+            let message: Vec<u8> = (0..9000u32).map(|i| (i % 251) as u8).collect();
+
+            let (sequential_commitment, sequential_shards) = encode(&message, k, m).unwrap();
+            let (parallel_commitment, parallel_shards) = encode_parallel(&message, k, m).unwrap();
+
+            assert_eq!(parallel_commitment, sequential_commitment, "n={}", n);
+            assert_eq!(parallel_shards, sequential_shards, "n={}", n);
+        }
+    }
+
+    /// The batch encoder is the AVID dealer's path. It must agree with encoding
+    /// one message at a time *and* keep input order, since the recipient of each
+    /// encoding is recovered by position.
+    #[test]
+    fn batch_encoding_matches_sequential_encoding_and_keeps_order() {
+        for n in [4usize, 7, 16] {
+            let (k, m) = split(n);
+            // Distinct lengths and contents, so a reordering cannot go unnoticed.
+            let messages: Vec<Vec<u8>> = (0..n)
+                .map(|j| (0..(500 + 37 * j) as u32).map(|i| (i % (240 + j as u32)) as u8).collect())
+                .collect();
+
+            let expected: Vec<(Commitment, Vec<Shard>)> = messages
+                .iter()
+                .map(|message| encode(message, k, m).unwrap())
+                .collect();
+            let batched = encode_batch(&messages, k, m).unwrap();
+
+            assert_eq!(batched.len(), messages.len(), "n={}", n);
+            for (index, (batch_entry, expected_entry)) in
+                batched.iter().zip(expected.iter()).enumerate()
+            {
+                assert_eq!(batch_entry.0, expected_entry.0, "n={} index={}", n, index);
+                assert_eq!(batch_entry.1, expected_entry.1, "n={} index={}", n, index);
+            }
+        }
+    }
+
+    /// A bad split is reported once for the batch, not once per message.
+    #[test]
+    fn batch_encoding_rejects_a_bad_split() {
+        let messages = vec![vec![1u8; 64], vec![2u8; 64]];
+        assert!(encode_batch(&messages, 0, 3).is_err());
+        assert!(encode_batch(&messages, 3, 0).is_err());
+    }
+
+    /// The async bridge exists so the tokio worker is not parked on a rayon
+    /// latch; it must still return exactly what the blocking call returns.
+    #[tokio::test]
+    async fn the_async_bridge_matches_the_blocking_batch() {
+        let n = 7usize;
+        let (k, m) = split(n);
+        let messages: Vec<Vec<u8>> = (0..n)
+            .map(|j| (0..(800 + 11 * j) as u32).map(|i| (i % 244) as u8).collect())
+            .collect();
+
+        let blocking = encode_batch(&messages, k, m).unwrap();
+        let bridged = encode_batch_async(messages, k, m).await.unwrap();
+
+        assert_eq!(bridged.len(), blocking.len());
+        for (bridged_entry, blocking_entry) in bridged.iter().zip(blocking.iter()) {
+            assert_eq!(bridged_entry.0, blocking_entry.0);
+            assert_eq!(bridged_entry.1, blocking_entry.1);
+        }
+    }
+
+    /// An empty batch is legal: an AVID dealer with nothing to send must not be
+    /// turned into a coding error.
+    #[test]
+    fn an_empty_batch_encodes_to_nothing() {
+        let (k, m) = split(4);
+        assert!(encode_batch(&[], k, m).unwrap().is_empty());
     }
 
     #[test]

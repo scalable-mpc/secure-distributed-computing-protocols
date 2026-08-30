@@ -25,27 +25,39 @@ impl Context {
         }
         filled_msg_vec.extend(msgs);
         
-        // Each element of the vector is an AVID for sending a message to a single replica
-        let mut avid_tree: Vec<(Replica,Vec<Shard>,Commitment)> = Vec::new();
-        let mut roots_agg: Vec<Hash> = Vec::new();
+        // Each element of the vector is an AVID for sending a message to a single replica.
+        // Serialize first: the batch encoder takes payloads alone, and each one's
+        // recipient is recovered by position afterwards.
+        let recipients: Vec<Replica> = filled_msg_vec.iter().map(|(party, _)| *party).collect();
+        let payloads: Vec<Vec<u8>> = filled_msg_vec
+            .into_iter()
+            .map(|(_party, msg)| {
+                let msg_length = msg.len();
+                bincode::serialize(&(msg, msg_length)).unwrap()
+            })
+            .collect();
 
-        for msg in filled_msg_vec{
-            let msg_length = msg.1.len();
-            let msg_with_length_serialized = bincode::serialize(&(msg.1, msg_length)).unwrap();
-            // Get encrypted text itself
-            let (commitment, shards) = match consensus::encode(
-                &msg_with_length_serialized,
-                self.num_nodes - 2 * self.num_faults,
-                2 * self.num_faults,
-            ) {
-                Ok(encoding) => encoding,
-                Err(error) => {
-                    log::error!("Failed to erasure code an AVID message: {}", error);
-                    return;
-                }
-            };
+        // `n` independent messages, each coded into `n` shards: the dealer's
+        // dominant cost. Run the batch on rayon, off this actor's tokio worker.
+        let encodings = match consensus::encode_batch_async(
+            payloads,
+            self.num_nodes - 2 * self.num_faults,
+            2 * self.num_faults,
+        )
+        .await
+        {
+            Ok(encodings) => encodings,
+            Err(error) => {
+                log::error!("Failed to erasure code an AVID message: {}", error);
+                return;
+            }
+        };
+
+        let mut avid_tree: Vec<(Replica,Vec<Shard>,Commitment)> = Vec::with_capacity(encodings.len());
+        let mut roots_agg: Vec<Hash> = Vec::with_capacity(encodings.len());
+        for (recipient, (commitment, shards)) in recipients.into_iter().zip(encodings) {
             roots_agg.push(commitment);
-            avid_tree.push((msg.0,shards,commitment));
+            avid_tree.push((recipient, shards, commitment));
         }
 
         let master_mt = MerkleTree::new(roots_agg, &self.hash_context);
@@ -54,6 +66,9 @@ impl Context {
             party_wise_share_map.insert(party, Vec::new());
         }
         for (index,tuple) in avid_tree.into_iter().enumerate(){
+            // The proof depends only on `index`, not on the recipient, so it is
+            // generated once per message instead of once per (message, party).
+            let master_proof = master_mt.gen_proof(index);
             for (party,fragment) in (0..self.num_nodes).into_iter().zip(tuple.1.into_iter()){
                 let avid_shard = AVIDShard{
                     id: instance_id,
@@ -61,7 +76,7 @@ impl Context {
                     recipient: tuple.0.clone(),
                     shard: fragment,
                     commitment: tuple.2,
-                    master_proof: master_mt.gen_proof(index),
+                    master_proof: master_proof.clone(),
                 };
                 party_wise_share_map.get_mut(&party).unwrap().push(avid_shard);
             }
