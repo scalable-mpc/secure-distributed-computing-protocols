@@ -6,7 +6,7 @@ use signal_hook::{
     consts::{SIGINT, SIGTERM},
     iterator::Signals,
 };
-use tokio::sync::{mpsc::{channel}, oneshot};
+use tokio::sync::{mpsc::{channel, Sender}, oneshot};
 use std::{net::{SocketAddr, SocketAddrV4}};
 
 #[tokio::main]
@@ -84,16 +84,16 @@ async fn main() -> Result<()> {
         config.update_config(util::io::file_to_ips(f.to_string()));
     }
     let config = config;
-    // Start the Reliable Broadcast protocol
-    let exit_tx;
-    match vss_type {
+    // Start the Reliable Broadcast protocol.
+    //
+    // `handles` must stay alive for as long as the protocol should run, so it
+    // is bound here in `main` rather than inside the match arm: a binding that
+    // goes out of scope at the end of the arm would shut the protocol down
+    // before we ever reach the signal wait below.
+    let handles = match vss_type {
         "ctrbc" => {
             log::info!("Cachin Tessaro RBC protocol");
-            let exit_tx_1;
-            let _status;
-
-            (exit_tx_1, _status) = spawn(config).await;
-            exit_tx = exit_tx_1.unwrap();
+            spawn(config).await?
         }
         _ => {
             log::error!(
@@ -102,15 +102,13 @@ async fn main() -> Result<()> {
             );
             return Ok(());
         }
-    }
-    //let exit_tx = pedavss_cc::node::Context::spawn(config).unwrap();
+    };
+
     // Implement a waiting strategy
     let mut signals = Signals::new(&[SIGINT, SIGTERM])?;
     signals.forever().next();
     log::error!("Received termination signal");
-    exit_tx
-        .send(())
-        .map_err(|_| anyhow!("Server already shut down"))?;
+    handles.shutdown();
     log::error!("Shutting down server");
     Ok(())
 }
@@ -120,39 +118,83 @@ pub fn to_socket_address(ip_str: &str, port: u16) -> SocketAddr {
     addr.into()
 }
 
-pub async fn spawn(config: Node)-> (anyhow::Result<oneshot::Sender<()>>, Vec<Result<oneshot::Sender<()>>>){
-    // ctrbc_req_send_channel: Request sending channel, request receiving channel. The sending channel can be used to issue message requests to the RBC module. 
-    // ctrbc_req_recv_channel: Request receiving channel - passed as an argument. The RBC module listens to this channel. 
+/// Handles that must outlive the protocol they started.
+///
+/// Every field here is load-bearing, because each context treats the far end of
+/// these channels as a shutdown signal:
+///
+/// * dropping an entry of `exit_handles` resolves that context's exit receiver
+///   with `RecvError`, which its run loop reports as `Consensus error: channel
+///   closed` before returning;
+/// * dropping `req_send` closes the request channel the context selects on,
+///   which it reports as `Networking layer has closed` before returning.
+///
+/// Either one stops the module within milliseconds of startup, so bind this
+/// value in a scope that lives as long as the protocol should. Binding it to
+/// `_`, or to a name inside a narrower block, drops it immediately and the
+/// module exits before doing any work.
+#[must_use = "dropping ProtocolHandles shuts the spawned protocol down immediately"]
+pub struct ProtocolHandles {
+    /// Issue requests to the module on this channel.
+    pub req_send: Sender<Vec<u8>>,
+    /// One exit handle per spawned context. Sending on a handle asks that
+    /// context to stop; dropping one stops it just as abruptly.
+    pub exit_handles: Vec<oneshot::Sender<()>>,
+}
+
+impl ProtocolHandles {
+    /// Ask every spawned context to stop.
+    ///
+    /// A send failure just means that context already exited, so it is ignored.
+    pub fn shutdown(self) {
+        for exit in self.exit_handles {
+            let _ = exit.send(());
+        }
+    }
+}
+
+/// Wire up and start the CTRBC module.
+///
+/// The returned [`ProtocolHandles`] owns everything that keeps the protocol
+/// alive; see its documentation for why the caller must hold on to it.
+pub async fn spawn(config: Node) -> Result<ProtocolHandles> {
+    // ctrbc_req_send_channel: Request sending channel, request receiving channel. The sending channel can be used to issue message requests to the RBC module.
+    // ctrbc_req_recv_channel: Request receiving channel - passed as an argument. The RBC module listens to this channel.
     let (ctrbc_req_send_channel, ctrbc_req_recv_channel) = channel(10000);
-    
-    // ctrbc_out_send_channel: Output sending channel - passed as an argument. The RBC module sends outputs on this channel. 
+
+    // ctrbc_out_send_channel: Output sending channel - passed as an argument. The RBC module sends outputs on this channel.
     // ctrbc_out_recv_channel: Output receiving channel. We poll this channel to get outputs from RBC module.
     let (ctrbc_out_send_channel, mut ctrbc_out_recv_channel) = channel(10000);
 
-    let mut statuses = Vec::new();
-
-    let _rbc_serv_status = ctrbc::Context::spawn(
+    // Start Cachin-Tessaro RBC protocol. The exit handle it returns is kept in
+    // `exit_handles`, which the caller owns.
+    let mut exit_handles = Vec::new();
+    exit_handles.push(ctrbc::Context::spawn(
         config,
-        ctrbc_req_recv_channel, 
-        ctrbc_out_send_channel, 
-        false
-    );
+        ctrbc_req_recv_channel,
+        ctrbc_out_send_channel,
+        false,
+    )?);
 
-    statuses.push(_rbc_serv_status);
-    
-    let _resp = ctrbc_req_send_channel.send(Vec::new()).await.unwrap();
-
+    // `while let Some(..)` rather than a `loop`: once the module drops its
+    // output sender, `recv` returns `None` forever, and a bare loop would spin
+    // on it instead of finishing.
     tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                msg = ctrbc_out_recv_channel.recv() => {
-                    // Execute handling logic for the received message from the channel
-                    log::debug!("Received message from CTRBC channel {:?}", msg);
-                    // self.process_ctrbc_event(ctrbc_msg.1, ctrbc_msg.0, ctrbc_msg.2).await;
-                }
-            }
+        while let Some(msg) = ctrbc_out_recv_channel.recv().await {
+            // Execute handling logic for the received message from the channel
+            log::debug!("Received message from CTRBC channel {:?}", msg);
+            // self.process_ctrbc_event(ctrbc_msg.1, ctrbc_msg.0, ctrbc_msg.2).await;
         }
+        log::info!("CTRBC output channel closed, stopping the output listener");
     });
-    let (exit_tx, _exit_rx) = oneshot::channel();
-    (Ok(exit_tx), vec![])
+
+    ctrbc_req_send_channel
+        .send(Vec::new())
+        .await
+        .map_err(|_| anyhow!("CTRBC stopped before the initial request was sent"))?;
+
+    Ok(ProtocolHandles {
+        req_send: ctrbc_req_send_channel,
+        exit_handles,
+    })
 }

@@ -44,51 +44,109 @@ mkdir testdata/
 ```
 These instructions generate configuration files for $n=4$ parties. Party $i$ runs on port `15000+i`, listens to requests on port `19000+i`, and syncs with a global synchronizer (this part is optional) on port `19500`. Please ensure the directory has been created to run this command. 
 
-2. **Create channels and invoke protocol**: The following snippet of code illustrates a basic composition of distributed protocols. 
+2. **Create channels and invoke protocol**: The following snippet of code illustrates a basic composition of distributed protocols. It is the real `spawn` from [`node/src/main.rs`](node/src/main.rs).
+
 ```rust
-pub async fn spawn(config: Node)-> (anyhow::Result<oneshot::Sender<()>>, Vec<Result<oneshot::Sender<()>>>){
-    // ctrbc_req_send_channel: Request sending channel, request receiving channel. The sending channel can be used to issue message requests to the RBC module. 
-    // ctrbc_req_recv_channel: Request receiving channel - passed as an argument. The RBC module listens to this channel. 
+/// Handles that must outlive the protocol they started.
+///
+/// Every field here is load-bearing, because each context treats the far end of
+/// these channels as a shutdown signal. See "Keeping a module alive" below.
+#[must_use = "dropping ProtocolHandles shuts the spawned protocol down immediately"]
+pub struct ProtocolHandles {
+    /// Issue requests to the module on this channel.
+    pub req_send: Sender<Vec<u8>>,
+    /// One exit handle per spawned context.
+    pub exit_handles: Vec<oneshot::Sender<()>>,
+}
+
+pub async fn spawn(config: Node) -> Result<ProtocolHandles> {
+    // req_send: used to issue message requests to the RBC module.
+    // req_recv: passed as an argument; the RBC module listens on it.
     let (ctrbc_req_send_channel, ctrbc_req_recv_channel) = channel(10000);
-    
-    // ctrbc_out_send_channel: Output sending channel - passed as an argument. The RBC module sends outputs on this channel. 
-    // ctrbc_out_recv_channel: Output receiving channel. We poll this channel to get outputs from RBC module.
+
+    // out_send: passed as an argument; the RBC module sends outputs on it.
+    // out_recv: polled here to receive those outputs.
     let (ctrbc_out_send_channel, mut ctrbc_out_recv_channel) = channel(10000);
 
-    let mut statuses = Vec::new();
-
-    // Start Cachin-Tessaro RBC protocol
-    let _rbc_serv_status = ctrbc::Context::spawn(
+    // Start Cachin-Tessaro RBC. Keep the exit handle it returns.
+    let mut exit_handles = Vec::new();
+    exit_handles.push(ctrbc::Context::spawn(
         config,
-        ctrbc_req_recv_channel, 
-        ctrbc_out_send_channel, 
-        false
-    );
-
-    statuses.push(_rbc_serv_status);
-    
-    let _resp = ctrbc_req_send_channel.send(Vec::new()).await.unwrap();
+        ctrbc_req_recv_channel,
+        ctrbc_out_send_channel,
+        false,
+    )?);
 
     tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                msg = ctrbc_out_recv_channel.recv() => {
-                    // Execute handling logic for the received message from the channel
-                    log::debug!("Received message from CTRBC channel {:?}", msg);
-                    // self.process_ctrbc_event(ctrbc_msg.1, ctrbc_msg.0, ctrbc_msg.2).await;
-                }
-            }
+        while let Some(msg) = ctrbc_out_recv_channel.recv().await {
+            log::debug!("Received message from CTRBC channel {:?}", msg);
         }
     });
-    let (exit_tx, _exit_rx) = oneshot::channel();
-    (Ok(exit_tx), vec![])
+
+    ctrbc_req_send_channel.send(Vec::new()).await
+        .map_err(|_| anyhow!("CTRBC stopped before the initial request was sent"))?;
+
+    Ok(ProtocolHandles { req_send: ctrbc_req_send_channel, exit_handles })
 }
 ```
+
 Protocols utilize `tokio` asynchronous channels or queues to receive requests and send outputs.
-Each protocol takes two `tokio` channels as input: a receiver channel from which it receives requests (`req_recv` channel), and a sender channel to which it can send outputs (`out_send` channel). 
-Each protocol's invocation takes these channels as arguments. 
-A prominent example of protocol composition is in `consensus/acs`. 
-This folder implements an Asynchronous Common Subset (ACS) protocol from Reliable Broadcast (CTRBC), Secret Key Sharing (ASKS), and Reliable Agreement (RA). 
+Each protocol takes two `tokio` channels as input: a receiver channel from which it receives requests (`req_recv` channel), and a sender channel to which it can send outputs (`out_send` channel).
+Each protocol's invocation takes these channels as arguments.
+A prominent example of protocol composition is in `consensus/acs`.
+This folder implements an Asynchronous Common Subset (ACS) protocol from Reliable Broadcast (CTRBC), Secret Key Sharing (ASKS), and Reliable Agreement (RA).
+
+### Keeping a module alive
+
+**A spawned module stops as soon as you drop the handles it was given.** This is the
+single most common way to get a protocol that appears to start and then does nothing,
+so it is worth stating explicitly.
+
+Every context's run loop selects over three things, and two of them are shutdown
+signals driven purely by ownership on *your* side:
+
+| You drop | The context sees | It logs and exits with |
+| --- | --- | --- |
+| the `oneshot::Sender<()>` returned by `Context::spawn` | its exit receiver resolving with `RecvError` | `Consensus error: channel closed` |
+| the request `Sender` | `req_recv.recv()` returning `None` | `Networking layer has closed` |
+
+Neither is an error you can see at the call site: the code compiles, `spawn` succeeds,
+and the module dies milliseconds later. So follow these rules.
+
+**Hold every handle for as long as the protocol should run.** Bind them in a scope that
+lives that long -- typically `main` -- not inside a block that ends sooner:
+
+```rust
+// WRONG: `handles` is dropped at the end of the match arm, so the protocol
+// is already dead by the time we wait for a signal.
+match protocol {
+    "ctrbc" => { let handles = spawn(config).await?; }
+    _ => return Ok(()),
+}
+signals.forever().next();
+
+// RIGHT: `handles` lives until `main` returns.
+let handles = match protocol {
+    "ctrbc" => spawn(config).await?,
+    _ => return Ok(()),
+};
+signals.forever().next();
+handles.shutdown();
+```
+
+**Never bind handles to `_`.** `let _ = Context::spawn(..)` drops the handle
+immediately; `let _handle = ..` keeps it. This is why `ProtocolHandles` is
+`#[must_use]`, and why the composed protocols in `consensus/acs`, `consensus/ibft`,
+and `consensus/fin_mvba` collect every sub-context handle into a `statuses` vector
+and return it to their caller rather than letting it fall out of scope.
+
+**Return handles up the stack when you compose.** A module that spawns sub-modules
+owns their handles and must pass them to *its* caller, so the lifetime decision stays
+with whoever knows how long the protocol should run.
+
+**Shut down explicitly rather than by dropping.** Sending on an exit handle lets the
+context break out of its loop and return `Ok(())`; dropping it makes the same thing
+happen via an error path, which is noisier and harder to distinguish from a real fault.
 
 3. **Build code and run parties**: After compiling the code, run $n=4$ parties to start the protocol. Each party waits until it establishes a tcp channel with **all** parties. 
 The `scripts/test.sh` script can also be used to start all four parties locally. 
