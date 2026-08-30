@@ -1,9 +1,9 @@
+use types::WrapperMsg;
 use std::sync::Arc;
 
 use crate::{context::Context, msg::ProtMsg};
 use crypto::hash::verf_mac;
-//use network::{plaintcp::CancelHandler, Acknowledgement};
-use types::{WrapperMsg};
+//use types::{WrapperMsg};
 
 impl Context {
     // This function verifies the Message Authentication Code (MAC) of a sent message
@@ -67,7 +67,7 @@ impl Context {
     //                 let sec_key = self.sec_key_map.get(&recipient).unwrap().clone();
     //                 let protocol_msg = ProtMsg::Deliver(avid_shard, avid_msg.origin, instance_id);
     //                 let wrapper_msg = WrapperMsg::new(protocol_msg.clone(),self.myid,&sec_key);
-    //                 let cancel_handler: CancelHandler<Acknowledgement> = self.net_send.send(recipient, wrapper_msg).await;
+    //                 let cancel_handler: CancelHandler = self.net_send.send(recipient, wrapper_msg).await;
     //                 self.add_cancel_handler(cancel_handler);
                 
     //             }

@@ -44,3 +44,10 @@ impl WireReady for SyncMsg{
         }
     }
 }
+impl common::Message for SyncMsg {
+    type DeserializationError = bincode::Error;
+
+    fn from_bytes(bytes: &[u8]) -> Result<Self, Self::DeserializationError> {
+        bincode::deserialize(bytes)
+    }
+}

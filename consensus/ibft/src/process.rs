@@ -3,8 +3,7 @@ use std::sync::Arc;
 use super::{ProtMsg};
 use crate::{context::Context};
 use crypto::hash::verf_mac;
-//use network::{plaintcp::CancelHandler, Acknowledgement};
-use types::{WrapperMsg};
+use types::WrapperMsg;
 
 impl Context {
     // This function verifies the Message Authentication Code (MAC) of a sent message

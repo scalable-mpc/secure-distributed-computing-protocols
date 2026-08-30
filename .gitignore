@@ -28,3 +28,8 @@ testdata/
 nodes-*.json
 
 *.log
+# generated test artifacts
+ip_file
+testdata/
+logs/
+logs_baseline/

@@ -90,8 +90,7 @@ impl Context {
 
             let protmsg = ProtMsg::Init(send_msg, instance_id);
             let wrapper = WrapperMsg::new(protmsg, self.myid, &sec_key);
-            let cancel_handler = self.net_send.send(replica, wrapper).await;
-            self.add_cancel_handler(cancel_handler);
+            self.send(replica, wrapper).await;
         }
     }
 

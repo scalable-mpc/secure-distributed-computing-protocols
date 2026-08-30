@@ -51,8 +51,7 @@ impl Context{
                         self.myid, 
                         sec_key
                     );
-                    let cancel_handler = self.net_send.send(index, wrapper_msg).await;
-                    self.add_cancel_handler(cancel_handler);
+                    self.send(index, wrapper_msg).await;
                 }
             }
         }

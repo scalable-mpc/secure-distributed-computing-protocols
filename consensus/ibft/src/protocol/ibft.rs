@@ -1,4 +1,3 @@
-use network::{Acknowledgement, plaintcp::CancelHandler};
 use types::{Replica, WrapperMsg};
 
 use crate::{Context, protocol::ibft_state::IBFTState, ProtMsg};
@@ -11,8 +10,7 @@ impl Context{
         let secret_key = self.sec_key_map.get(&self.leader_id).unwrap().clone();
         let wrapper_msg = WrapperMsg::new(prot_msg,self.myid, &secret_key);
 
-        let cancel_handler: CancelHandler<Acknowledgement> = self.net_send.send(self.leader_id, wrapper_msg).await;
-        self.add_cancel_handler(cancel_handler);
+        self.send(self.leader_id, wrapper_msg).await;
     }
 
     pub async fn process_acss_termination(&mut self, instance_id: usize, term_party: Replica, sender: Replica){

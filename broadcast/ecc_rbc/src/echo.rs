@@ -4,7 +4,6 @@ use crate::msg::Share;
 use super::{Context, ShareMsg, ProtMsg};
 use types::WrapperMsg;
 
-use network::{plaintcp::CancelHandler, Acknowledgement};
 impl Context {
     pub async fn echo_self(&mut self, hash: Hash, share: Share) {
         let msg = ShareMsg {
@@ -54,9 +53,7 @@ impl Context {
             };
             let protocol_msg = ProtMsg::Echo(msg, self.myid);
             let wrapper_msg = WrapperMsg::new(protocol_msg.clone(), self.myid, &sec_key.as_slice());
-            let cancel_handler: CancelHandler<Acknowledgement> =
-            self.net_send.send(replica, wrapper_msg).await;
-            self.add_cancel_handler(cancel_handler);
+            self.send(replica, wrapper_msg).await;
         }
     }
 

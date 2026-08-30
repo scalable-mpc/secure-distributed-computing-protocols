@@ -4,7 +4,6 @@ use crate::Status;
 use crate::{Context, ProtMsg};
 use bincode;
 use crypto::hash::{do_hash};
-use network::{plaintcp::CancelHandler, Acknowledgement};
 use types::WrapperMsg;
 
 impl Context {
@@ -91,9 +90,7 @@ impl Context {
 
                 let sec_key = &self.sec_key_map[&replica];
                 let wrapped = WrapperMsg::new(proto_msg.clone(), self.myid, sec_key);
-                let cancel_handler: CancelHandler<Acknowledgement> =
-                    self.net_send.send(replica, wrapped).await;
-                self.add_cancel_handler(cancel_handler);
+                self.send(replica, wrapped).await;
             }
         }
     }

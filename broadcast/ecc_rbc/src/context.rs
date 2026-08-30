@@ -9,10 +9,9 @@ use config::Node;
 use crypto::hash::Hash;
 
 use fnv::FnvHashMap;
-use network::{
-    plaintcp::{CancelHandler, TcpReceiver, TcpReliableSender},
-    Acknowledgement,
-};
+use futures::StreamExt;
+use tcp_receiver::TcpReceiver;
+use tcp_reliable_sender::{CancelHandler, TcpReliableSender};
 use tokio::sync::{
     mpsc::{unbounded_channel, UnboundedReceiver},
     oneshot,
@@ -22,16 +21,15 @@ use types::{Replica, SyncMsg, SyncState};
 
 use crate::msg::Share;
 
-use super::{Handler, SyncHandler};
 use super::ProtMsg;
 
 use types::WrapperMsg;
 
 pub struct Context {
     /// Networking context
-    pub net_send: TcpReliableSender<Replica, WrapperMsg<ProtMsg>, Acknowledgement>,
+    pub net_send: TcpReliableSender<Replica, WrapperMsg<ProtMsg>>,
     pub net_recv: UnboundedReceiver<WrapperMsg<ProtMsg>>,
-    pub sync_send: TcpReliableSender<Replica, SyncMsg, Acknowledgement>,
+    pub sync_send: TcpReliableSender<Replica, SyncMsg>,
     pub sync_recv: UnboundedReceiver<SyncMsg>,
     /// Data context
     pub num_nodes: usize,
@@ -44,7 +42,7 @@ pub struct Context {
     pub sec_key_map: HashMap<Replica, Vec<u8>>,
 
     /// Cancel Handlers
-    pub cancel_handlers: HashMap<u64, Vec<CancelHandler<Acknowledgement>>>,
+    pub cancel_handlers: HashMap<u64, Vec<CancelHandler>>,
     exit_rx: oneshot::Receiver<()>,
     // Add your custom fields here
     pub received_echo_count: HashMap<Hash, usize>,
@@ -72,26 +70,52 @@ impl Context {
 
         // Setup networking
         let (tx_net_to_consensus, rx_net_to_consensus) = unbounded_channel();
-        TcpReceiver::<Acknowledgement, WrapperMsg<ProtMsg>, _>::spawn(
-            my_address,
-            Handler::new(tx_net_to_consensus),
-        );
+        let mut net_receiver =
+            TcpReceiver::<WrapperMsg<ProtMsg>>::spawn_with_options(my_address, types::net_options());
+        // The upstream receiver is a stream rather than a dispatch handler, and
+        // acknowledges every frame itself, so pump it into the channel the
+        // protocol already selects on.
+        tokio::spawn(async move {
+            while let Some(msg) = net_receiver.next().await {
+                match msg {
+                    Ok(msg) => {
+                        if tx_net_to_consensus.send(msg).is_err() {
+                            log::error!("Consensus channel closed, stopping the receiver");
+                            break;
+                        }
+                    }
+                    Err(e) => log::error!("Failed to decode an incoming message: {}", e),
+                }
+            }
+        });
 
         let syncer_listen_port = config.client_port;
         let syncer_l_address = to_socket_address("0.0.0.0", syncer_listen_port);
 
         // The server must listen to the client's messages on some port that is not being used to listen to other servers
         let (tx_net_to_client, rx_net_from_client) = unbounded_channel();
-        TcpReceiver::<Acknowledgement, SyncMsg, _>::spawn(
-            syncer_l_address,
-            SyncHandler::new(tx_net_to_client),
-        );
+        let mut sync_receiver =
+            TcpReceiver::<SyncMsg>::spawn_with_options(syncer_l_address, types::net_options());
+        // The upstream receiver is a stream rather than a dispatch handler, and
+        // acknowledges every frame itself, so pump it into the channel the
+        // protocol already selects on.
+        tokio::spawn(async move {
+            while let Some(msg) = sync_receiver.next().await {
+                match msg {
+                    Ok(msg) => {
+                        if tx_net_to_client.send(msg).is_err() {
+                            log::error!("Consensus channel closed, stopping the receiver");
+                            break;
+                        }
+                    }
+                    Err(e) => log::error!("Failed to decode an incoming message: {}", e),
+                }
+            }
+        });
 
-        let consensus_net = TcpReliableSender::<Replica, WrapperMsg<ProtMsg>, Acknowledgement>::with_peers(
-            consensus_addrs.clone(),
-        );
+        let consensus_net = TcpReliableSender::<Replica, WrapperMsg<ProtMsg>>::with_peers_and_options(consensus_addrs.clone(), types::net_options());
         let sync_net =
-            TcpReliableSender::<Replica, SyncMsg, Acknowledgement>::with_peers(syncer_map);
+            TcpReliableSender::<Replica, SyncMsg>::with_peers_and_options(syncer_map, types::net_options());
         let (exit_tx, exit_rx) = oneshot::channel();
 
         tokio::spawn(async move {
@@ -142,38 +166,58 @@ impl Context {
             }
             if replica != self.myid {
                 let wrapper_msg = WrapperMsg::new(protmsg.clone(), self.myid, &sec_key.as_slice());
-                let cancel_handler: CancelHandler<Acknowledgement> =
-                    self.net_send.send(replica, wrapper_msg).await;
-                self.add_cancel_handler(cancel_handler);
+                self.send(replica, wrapper_msg).await;
             }
         }
     }
 
-    pub fn add_cancel_handler(&mut self, canc: CancelHandler<Acknowledgement>) {
+    pub fn add_cancel_handler(&mut self, canc: CancelHandler) {
         self.cancel_handlers.entry(0).or_default().push(canc);
     }
 
+    /// Same funnel as [`Context::send`], for the syncer channel.
+    pub async fn sync_send(&mut self, replica: Replica, sync_msg: SyncMsg) {
+        let bytes = match bincode::serialize(&sync_msg) {
+            Ok(bytes) => bytes::Bytes::from(bytes),
+            Err(e) => {
+                log::error!("Failed to serialize a sync message for {}: {}", replica, e);
+                return;
+            }
+        };
+        match self.sync_send.send(replica, bytes).await {
+            Ok(cancel_handler) => self.add_cancel_handler(cancel_handler),
+            Err(e) => log::error!("Failed to send a sync message to {}: {}", replica, e),
+        }
+    }
+
+    /// The upstream sender takes raw bytes, so encoding happens here rather
+    /// than inside the networking crate.
     pub async fn send(&mut self, replica: Replica, wrapper_msg: WrapperMsg<ProtMsg>) {
-        let cancel_handler: CancelHandler<Acknowledgement> =
-            self.net_send.send(replica, wrapper_msg).await;
-        self.add_cancel_handler(cancel_handler);
+        let bytes = match bincode::serialize(&wrapper_msg) {
+            Ok(bytes) => bytes::Bytes::from(bytes),
+            Err(e) => {
+                log::error!("Failed to serialize a message for {}: {}", replica, e);
+                return;
+            }
+        };
+        match self.net_send.send(replica, bytes).await {
+            Ok(cancel_handler) => self.add_cancel_handler(cancel_handler),
+            Err(e) => log::error!("Failed to send a message to {}: {}", replica, e),
+        }
     }
 
     pub async fn run(&mut self) -> Result<()> {
         // The process starts listening to messages in this process.
         // First, the node sends an alive message
-        let cancel_handler = self
-            .sync_send
-            .send(
-                0,
+        self.sync_send(
+            0,
                 SyncMsg {
                     sender: self.myid,
                     state: SyncState::ALIVE,
                     value: "".to_string().into_bytes(),
                 },
-            )
-            .await;
-        self.add_cancel_handler(cancel_handler);
+        )
+        .await;
         loop {
             tokio::select! {
                 // Receive exit handlers

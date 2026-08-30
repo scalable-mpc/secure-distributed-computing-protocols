@@ -58,17 +58,14 @@ impl Context {
 
     // Invoke this function once you terminate the protocol
     pub async fn terminate(&mut self, data: String) {
-        let cancel_handler = self
-            .sync_send
-            .send(
-                0,
+        self.sync_send(
+            0,
                 SyncMsg {
                     sender: self.myid,
                     state: SyncState::COMPLETED,
                     value: data.into_bytes(),
                 },
-            )
-            .await;
-        self.add_cancel_handler(cancel_handler);
+        )
+        .await;
     }
 }

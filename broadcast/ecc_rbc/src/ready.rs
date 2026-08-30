@@ -1,7 +1,6 @@
 use super::{ProtMsg, ShareMsg};
 use types::WrapperMsg;
 use crypto::hash::Hash;
-use network::{plaintcp::CancelHandler, Acknowledgement};
 
 use super::Context;
 impl Context {
@@ -32,9 +31,7 @@ impl Context {
                 continue;
             }
             let wrapper_msg = WrapperMsg::new(protocol_msg.clone(), self.myid, &sec_key.as_slice());
-            let cancel_handler: CancelHandler<Acknowledgement> =
-                self.net_send.send(replica, wrapper_msg).await;
-            self.add_cancel_handler(cancel_handler);
+            self.send(replica, wrapper_msg).await;
         }
     }
 

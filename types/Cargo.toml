@@ -21,6 +21,7 @@ num-bigint = {version = "0.2.6", features = ["rand"]}
 sha2="0.9.2"
 sha3="0.9.1"
 base64 = "0.13.1"
+common = { package = "common", git = "https://github.com/libdist-rs/libnet-rs.git", tag = "v0.2.1" }
 
 [features]
 default=["mempool"]

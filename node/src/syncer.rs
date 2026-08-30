@@ -2,12 +2,13 @@ use std::{collections::{HashSet, HashMap}, net::{SocketAddr,SocketAddrV4}, time:
 
 use anyhow::{Result, anyhow};
 use fnv::FnvHashMap;
-use network::{plaintcp::{TcpReceiver, TcpReliableSender, CancelHandler}, Acknowledgement};
+use futures::StreamExt;
+use tcp_receiver::TcpReceiver;
+use tcp_reliable_sender::{CancelHandler, TcpReliableSender};
 use tokio::{sync::{oneshot, mpsc::{unbounded_channel, UnboundedReceiver}}, time};
 use types::{Replica, SyncMsg, SyncState, ProtSyncMsg};
 //use std::fs::read_to_string;
 
-use crate::SyncHandler;
 
 pub struct Syncer{
     pub num_nodes: usize,
@@ -30,11 +31,11 @@ pub struct Syncer{
     pub cli_addr: SocketAddr,
     
     pub rx_net: UnboundedReceiver<SyncMsg>,
-    pub net_send: TcpReliableSender<Replica,SyncMsg,Acknowledgement>,
+    pub net_send: TcpReliableSender<Replica, SyncMsg>,
     
     exit_rx: oneshot::Receiver<()>,
     /// Cancel Handlers
-    pub cancel_handlers: Vec<CancelHandler<Acknowledgement>>,
+    pub cancel_handlers: Vec<CancelHandler>,
 }
 
 impl Syncer{
@@ -47,17 +48,33 @@ impl Syncer{
         let (tx_net_to_server, rx_net_to_server) = unbounded_channel();
         let cli_addr_sock = cli_addr.port();
         let new_sock_address = SocketAddrV4::new("0.0.0.0".parse().unwrap(), cli_addr_sock);
-        TcpReceiver::<Acknowledgement, SyncMsg, _>::spawn(
+        let mut receiver = TcpReceiver::<SyncMsg>::spawn_with_options(
             std::net::SocketAddr::V4(new_sock_address),
-            SyncHandler::new(tx_net_to_server),
+            types::net_options(),
         );
+        // The upstream receiver is a stream rather than a dispatch handler, and
+        // acknowledges every frame itself, so pump it into the channel the
+        // syncer already selects on.
+        tokio::spawn(async move {
+            while let Some(msg) = receiver.next().await {
+                match msg {
+                    Ok(msg) => {
+                        if tx_net_to_server.send(msg).is_err() {
+                            log::error!("Syncer channel closed, stopping the receiver");
+                            break;
+                        }
+                    }
+                    Err(e) => log::error!("Failed to decode an incoming sync message: {}", e),
+                }
+            }
+        });
         //let broadcast_msgs = read_lines(&filename);
         let mut server_addrs :FnvHashMap<Replica,SocketAddr>= FnvHashMap::default();
         for (replica,address) in net_map.iter(){
             let address:SocketAddr = address.parse().expect("Unable to parse address");
             server_addrs.insert(*replica, SocketAddr::from(address.clone()));
         }
-        let net_send = TcpReliableSender::<Replica,SyncMsg,Acknowledgement>::with_peers(server_addrs);
+        let net_send = TcpReliableSender::<Replica, SyncMsg>::with_peers_and_options(server_addrs, types::net_options());
         tokio::spawn(async move{
             let mut syncer = Syncer{
                 net_map:net_map.clone(),
@@ -91,8 +108,7 @@ impl Syncer{
     }
     pub async fn broadcast(&mut self, sync_msg:SyncMsg){
         for replica in 0..self.num_nodes {
-            let cancel_handler:CancelHandler<Acknowledgement> = self.net_send.send(replica, sync_msg.clone()).await;
-            self.add_cancel_handler(cancel_handler);    
+            self.send(replica, sync_msg.clone()).await;    
         }
     }
     pub async fn run(&mut self)-> Result<()>{
@@ -175,7 +191,7 @@ impl Syncer{
                             value: vec![],
                         };
                         let binaryfy_val = bincode::serialize(&sync_rbc_msg).expect("Failed to serialize client message");
-                        // let cancel_handler:CancelHandler<Acknowledgement> = self.net_send.send(0, SyncMsg { 
+                        // let cancel_handler:CancelHandler = self.net_send.send(0, SyncMsg { 
                         //     sender: self.num_nodes, 
                         //     state: SyncState::START,
                         //     value:binaryfy_val
@@ -199,9 +215,25 @@ impl Syncer{
         }
         Ok(())
     }
-    pub fn add_cancel_handler(&mut self, canc: CancelHandler<Acknowledgement>){
+    pub fn add_cancel_handler(&mut self, canc: CancelHandler){
         self.cancel_handlers
             .push(canc);
+    }
+
+    /// The upstream sender takes raw bytes, so encoding happens here rather
+    /// than inside the networking crate.
+    pub async fn send(&mut self, replica: Replica, sync_msg: SyncMsg) {
+        let bytes = match bincode::serialize(&sync_msg) {
+            Ok(bytes) => bytes::Bytes::from(bytes),
+            Err(e) => {
+                log::error!("Failed to serialize a sync message for {}: {}", replica, e);
+                return;
+            }
+        };
+        match self.net_send.send(replica, bytes).await {
+            Ok(cancel_handler) => self.add_cancel_handler(cancel_handler),
+            Err(e) => log::error!("Failed to send a sync message to {}: {}", replica, e),
+        }
     }
 }
 

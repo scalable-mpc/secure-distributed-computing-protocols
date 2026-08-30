@@ -43,3 +43,17 @@ impl<T: Debug+Serialize+ DeserializeOwned+Clone+ Sync+ Send> WireReady for Wrapp
         }
     }
 }
+/// Decoding for the upstream `libnet-rs` receiver.
+///
+/// Unlike [`WireReady::from_bytes`], this reports malformed input as an error
+/// instead of panicking, so a corrupt or adversarial frame cannot take the
+/// receiver task down.
+impl<T: Debug + Serialize + DeserializeOwned + Clone + Sync + Send> common::Message
+    for WrapperMsg<T>
+{
+    type DeserializationError = bincode::Error;
+
+    fn from_bytes(bytes: &[u8]) -> Result<Self, Self::DeserializationError> {
+        bincode::deserialize(bytes)
+    }
+}

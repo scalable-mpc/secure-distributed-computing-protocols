@@ -36,7 +36,8 @@ rand_core = "0.6.4"
 num-bigint-dig = "0.4"
 num-bigint = {version = "0.2.6", features = ["rand"]}
 
-network = { package = "network", git = "https://github.com/akhilsb/libnet-rs.git" }
+tcp-reliable-sender = { package = "tcp-reliable-sender", git = "https://github.com/libdist-rs/libnet-rs.git", tag = "v0.2.1" }
+tcp-receiver = { package = "tcp-receiver", git = "https://github.com/libdist-rs/libnet-rs.git", tag = "v0.2.1" }
 async-trait = "0"
 futures-util = "0"
 

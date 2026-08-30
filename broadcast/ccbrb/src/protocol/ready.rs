@@ -34,8 +34,7 @@ impl Context {
             }
 
             let wrapper = WrapperMsg::new(proto.clone(), self.myid, &sec_key);
-            let cancel_handler = self.net_send.send(replica, wrapper).await;
-            self.add_cancel_handler(cancel_handler);
+            self.send(replica, wrapper).await;
         }
     }
 
@@ -135,9 +134,30 @@ impl Context {
 
                                         let wrapper =
                                             WrapperMsg::new(proto.clone(), self.myid, &sec_key);
-                                        let cancel_handler =
-                                            self.net_send.send(replica, wrapper).await;
-                                        cancel_handlers.push(cancel_handler);
+                                        // Collected rather than registered here:
+                                        // `rbc_context` is still borrowed, so the
+                                        // handlers are drained after the loop.
+                                        match bincode::serialize(&wrapper) {
+                                            Ok(bytes) => match self
+                                                .net_send
+                                                .send(replica, bytes::Bytes::from(bytes))
+                                                .await
+                                            {
+                                                Ok(cancel_handler) => {
+                                                    cancel_handlers.push(cancel_handler)
+                                                }
+                                                Err(e) => log::error!(
+                                                    "Failed to send a message to {}: {}",
+                                                    replica,
+                                                    e
+                                                ),
+                                            },
+                                            Err(e) => log::error!(
+                                                "Failed to serialize a message for {}: {}",
+                                                replica,
+                                                e
+                                            ),
+                                        }
                                     }
                                     break;
                                 }
