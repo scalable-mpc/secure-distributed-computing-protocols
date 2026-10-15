@@ -63,9 +63,11 @@ impl HashState{
             x_11[i] = one[i].wrapping_add(two[i].wrapping_mul(2));
             x_12[i] = one[16+i].wrapping_add(two[16+i].wrapping_mul(2));
         }
-        let blk_11 = GenericArray::from(x_11);
-        let blk_12 = GenericArray::from(x_12);
-        self.aes0.encrypt_blocks(&mut [blk_11,blk_12]);
+        // Encrypt in place. `GenericArray` is `Copy`, so `&mut [blk_11, blk_12]`
+        // encrypts a temporary copy and the result is lost. The same applies below.
+        let mut blks = [GenericArray::from(x_11), GenericArray::from(x_12)];
+        self.aes0.encrypt_blocks(&mut blks);
+        let [blk_11, blk_12] = blks;
 
         let mut x_21 = [0u8;16];
         let mut x_22 = [0u8;16];
@@ -73,9 +75,9 @@ impl HashState{
             x_21[i] = (one[i].wrapping_mul(2)).wrapping_add(two[i].wrapping_mul(2)).wrapping_add(blk_11[i]);
             x_22[i] = (one[16+i].wrapping_mul(2)).wrapping_add(two[16+i].wrapping_mul(2)).wrapping_add(blk_12[i]);
         }
-        let blk_21 = GenericArray::from(x_21);
-        let blk_22 = GenericArray::from(x_22);
-        self.aes1.encrypt_blocks(&mut [blk_21,blk_22]);
+        let mut blks = [GenericArray::from(x_21), GenericArray::from(x_22)];
+        self.aes1.encrypt_blocks(&mut blks);
+        let [blk_21, blk_22] = blks;
 
         let mut x_31 = [0u8;16];
         let mut x_32 = [0u8;16];
@@ -84,9 +86,9 @@ impl HashState{
             x_31[i] = (one[i].wrapping_mul(2)).wrapping_add(two[i]).wrapping_add(blk_21[i]);
             x_32[i] = (one[16+i].wrapping_mul(2)).wrapping_add(two[16+i]).wrapping_add(blk_22[i]);
         }
-        let blk_31 = GenericArray::from(x_31);
-        let blk_32 = GenericArray::from(x_32);
-        self.aes2.encrypt_blocks(&mut [blk_31,blk_32]);
+        let mut blks = [GenericArray::from(x_31), GenericArray::from(x_32)];
+        self.aes2.encrypt_blocks(&mut blks);
+        let [blk_31, blk_32] = blks;
 
         let mut w_1 = [0u8;32];
         for i in 0..16{
@@ -161,7 +163,7 @@ impl HashState{
         self.aes2.encrypt_blocks(&mut q1_vec);
         self.aes2.encrypt_blocks(&mut q2_vec);
         
-        let it4 = fin_vec.iter().zip(q1_vec.iter().zip(q1_vec.iter()));
+        let it4 = fin_vec.iter().zip(q1_vec.iter().zip(q2_vec.iter()));
         let mut output_vec = Vec::new();
         for (_,(f,(o,t))) in it4.enumerate(){
             let mut w_1 = [0u8;32];
@@ -199,6 +201,67 @@ impl HashState{
                 return hash;
             }).collect();
             return MerkleTree::new(chunks, self).root();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hash_state() -> HashState {
+        HashState::new([1u8; 16], [2u8; 16], [3u8; 16])
+    }
+
+    /// A regression test: without the AES output, `hash_two` was
+    /// `15 * one + 16 * two` in each byte and did not depend on the keys.
+    #[test]
+    fn hash_two_depends_on_the_keys_and_is_not_linear() {
+        let (one, two) = ([3u8; 32], [200u8; 32]);
+        let hash = hash_state().hash_two(one, two);
+        let linear: Vec<u8> = (0..32)
+            .map(|i| one[i].wrapping_mul(15).wrapping_add(two[i].wrapping_mul(16)))
+            .collect();
+        assert_ne!(hash.to_vec(), linear);
+        assert_ne!(hash, HashState::new([9u8; 16], [8u8; 16], [7u8; 16]).hash_two(one, two));
+    }
+
+    #[test]
+    fn hash_batch_agrees_with_hash_two() {
+        let hs = hash_state();
+        let one: Vec<[u8; 32]> = (0..9u8).map(|j| [j.wrapping_mul(29); 32]).collect();
+        let two: Vec<[u8; 32]> = (0..9u8).map(|j| core::array::from_fn(|i| j ^ i as u8)).collect();
+        let expected: Vec<[u8; 32]> = one.iter().zip(&two).map(|(o, t)| hs.hash_two(*o, *t)).collect();
+        assert_eq!(hs.hash_batch(one, two), expected);
+    }
+
+    /// Each leaf must change the root. With the linear `hash_two`, 11 of the
+    /// 16 leaves of a 16-leaf tree did not.
+    #[test]
+    fn every_leaf_changes_the_merkle_root() {
+        let hs = hash_state();
+        for n in 2..=33u8 {
+            let leaves: Vec<Hash> = (0..n).map(|j| [j; 32]).collect();
+            let root = MerkleTree::new(leaves.clone(), &hs).root();
+            for j in 0..n as usize {
+                let mut changed = leaves.clone();
+                changed[j][0] ^= 1;
+                assert_ne!(MerkleTree::new(changed, &hs).root(), root, "n={} leaf={}", n, j);
+            }
+        }
+    }
+
+    /// `build_trees` hashes with `hash_batch`, and `Proof::validate` with
+    /// `hash_two`. The two paths must give the same tree.
+    #[test]
+    fn build_trees_agrees_with_merkle_tree_new() {
+        let hs = hash_state();
+        let data: Vec<Vec<Hash>> = (0..3u8)
+            .map(|t| (0..7u8).map(|j| [t * 16 + j; 32]).collect())
+            .collect();
+        for (tree, leaves) in MerkleTree::build_trees(data.clone(), &hs).iter().zip(data) {
+            assert_eq!(tree.root(), MerkleTree::new(leaves, &hs).root());
+            assert!(tree.gen_proof(5).validate(&hs));
         }
     }
 }
