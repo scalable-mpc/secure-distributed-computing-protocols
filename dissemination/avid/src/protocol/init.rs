@@ -43,6 +43,7 @@ impl Context {
             payloads,
             self.num_nodes - 2 * self.num_faults,
             2 * self.num_faults,
+            self.hash_context.clone(),
         )
         .await
         {

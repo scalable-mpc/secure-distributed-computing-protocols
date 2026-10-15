@@ -1,4 +1,5 @@
 use consensus::{CheckedShard, Commitment, Shard};
+use crypto::aes_hash::HashState;
 use serde::{Deserialize, Serialize};
 
 use types::Replica;
@@ -30,6 +31,7 @@ impl CTRBCMsg {
         index: Replica,
         num_nodes: usize,
         num_faults: usize,
+        hash_state: &HashState,
     ) -> Option<CheckedShard> {
         consensus::check(
             &self.commitment,
@@ -37,6 +39,7 @@ impl CTRBCMsg {
             &self.shard,
             num_nodes - 2 * num_faults,
             2 * num_faults,
+            hash_state,
         )
         .ok()
     }

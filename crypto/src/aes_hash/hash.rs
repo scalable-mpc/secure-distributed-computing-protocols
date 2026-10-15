@@ -35,6 +35,7 @@ use crate::{aes_hash::{MerkleTree, HASH_SIZE}, hash::Hash};
 //     }
 // }
 
+#[derive(Clone)]
 pub struct HashState{
     pub aes0: Aes128Enc,
     pub aes1: Aes128Enc,

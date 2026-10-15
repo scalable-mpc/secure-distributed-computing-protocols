@@ -1,117 +1,57 @@
-//! Erasure coding, backed by [`commonware_coding`].
+//! Erasure coding, backed by [`reed_solomon_simd`] (Leopard-RS over GF(2^16),
+//! O(n log n)).
 //!
 //! Two layers are exposed, because the protocols in this repository commit to
 //! shards in two different ways.
 //!
-//! * The **committed** layer (this module's root) is
-//!   [`commonware_coding::ReedSolomon`]. `encode` returns a single 32-byte
-//!   commitment plus `n` shards, each of which already carries a Merkle
-//!   inclusion proof against that commitment. Protocols that used to call
-//!   `get_shards` and then build their own Merkle tree over the shard hashes
-//!   (`ctrbc`, `asks`, `avid`) use this and drop their tree entirely.
+//! * The **committed** layer (this module's root). `encode` returns one 32-byte
+//!   commitment and `n` shards. The commitment is the root of the AES Merkle
+//!   tree of [`crypto::aes_hash`] over the SHA-256 hash of each shard, and each
+//!   shard carries its inclusion proof. `ctrbc`, `asks` and `avid` use this
+//!   layer.
 //!
-//! * The **raw** layer ([`raw`]) is the bare Reed-Solomon coder with no
-//!   commitment at all, presented with the same signatures the old
-//!   `reed-solomon-erasure` helpers had. `ccbrb` commits to its shards with an
-//!   explicit vector of hashes rather than a Merkle root, so it needs the coder
-//!   without the commitment attached.
+//! * The **raw** layer ([`raw`]) is the bare coder with no commitment. `ccbrb`
+//!   and `ecc_rbc` commit to their shards with a vector of hashes, so they use
+//!   this layer.
 //!
-//! Both layers run commonware's vendored `reed-solomon-simd` (Leopard-RS over
-//! GF(2^16), O(n log n)), replacing `reed-solomon-erasure`'s scalar GF(2^8)
-//! matrix coder.
+//! # Data layout
 //!
-//! # Wire format
-//!
-//! [`Shard`] and [`Commitment`] both travel inside this repository's
-//! `serde`/`bincode` messages, but commonware types implement
-//! `commonware_codec` rather than `serde`. [`Shard`] bridges the two: it
-//! serializes as the byte string produced by commonware's codec and is read
-//! back with [`MAX_SHARD_SIZE`] as the length bound. [`Commitment`] is a
-//! SHA-256 digest and is carried as a plain `[u8; 32]`, so it is directly
-//! usable as a `HashMap` key the way Merkle roots were before.
+//! The `k` data shards hold `[u32 length (big endian) | data | zero padding]`.
+//! The shard width is the smallest even width that holds the prefix and the
+//! data. [`decode`] rejects any other layout, so one commitment decodes to at
+//! most one message.
 
+use std::collections::BTreeMap;
 use std::convert::TryFrom;
 use std::fmt;
-use std::num::NonZeroU16;
 
-use commonware_codec::{Decode, Encode};
-use commonware_coding::{CodecConfig, Config, ReedSolomon, Scheme};
-use commonware_cryptography::{sha256::Digest as Sha256Digest, Sha256};
-use commonware_parallel::{Rayon, Sequential};
-use crypto::hash::Hash;
+use crypto::aes_hash::{HashState, MerkleTree, Proof};
+use crypto::hash::{do_hash, Hash};
 use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::sync::OnceLock;
+use reed_solomon_simd::ReedSolomonEncoder;
+use serde::{Deserialize, Serialize};
 
-/// The coding scheme every protocol in this repository uses.
-type Coder = ReedSolomon<Sha256>;
-
-/// Parallelism strategy handed to commonware.
-///
-/// `Sequential` is deliberate: several protocols (`acs`, `fin_mvba`) run tens
-/// of coding instances concurrently on the tokio runtime, and handing each of
-/// them a rayon pool oversubscribes the machine rather than speeding any single
-/// one up. Switch this one constant to `commonware_parallel::Rayon` if a
-/// deployment runs one large broadcast at a time.
-const STRATEGY: Sequential = Sequential;
-
-/// Upper bound accepted when reading a [`Shard`] off the wire, in bytes.
-///
-/// This only bounds the allocation a malformed message can request; it is not a
-/// protocol parameter. 256 MiB per shard is far above anything these protocols
-/// broadcast, and the previous code (a bare `Vec<u8>` field) had no bound at
-/// all.
-pub const MAX_SHARD_SIZE: usize = 256 * 1024 * 1024;
-
-/// A commitment to a full set of shards: the root of commonware's binary
-/// Merkle tree over the shard hashes.
-///
-/// This is the same 32 bytes the protocols previously used as their Merkle
-/// root, so it drops into the same `HashMap<Hash, _>` state.
+/// A commitment to a full set of shards: the root of the Merkle tree over the
+/// shard hashes.
 pub type Commitment = Hash;
 
-/// A shard that has been verified against a [`Commitment`].
-///
-/// Produced by [`check`] and consumed by [`decode`]. Not serializable by
-/// design: it is evidence that *this* process verified the shard, so it must
-/// not be accepted from the network.
-pub type CheckedShard = <Coder as Scheme>::CheckedShard;
+/// One shard of an erasure-coded message, with its Merkle inclusion proof
+/// against the [`Commitment`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Shard {
+    bytes: Vec<u8>,
+    proof: Proof,
+}
 
-/// One shard of an erasure-coded message, together with its Merkle inclusion
-/// proof against the [`Commitment`].
+/// A shard that [`check`] verified against a [`Commitment`].
 ///
-/// Replaces the old `(Vec<u8>, crypto::aes_hash::Proof)` pair.
+/// This type is not serializable. It shows that *this* process verified the
+/// shard, so the network must not supply it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Shard(<Coder as Scheme>::Shard);
-
-impl Shard {
-    /// Size of this shard on the wire, in bytes.
-    ///
-    /// A `Chunk` does not expose its index, and deliberately so: a shard's
-    /// position is asserted by the verifier in [`check`], never read out of the
-    /// shard itself.
-    pub fn wire_size(&self) -> usize {
-        self.0.encode().len()
-    }
-}
-
-impl Serialize for Shard {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let bytes = self.0.encode();
-        serializer.serialize_bytes(bytes.as_ref())
-    }
-}
-
-impl<'de> Deserialize<'de> for Shard {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let bytes = <Vec<u8>>::deserialize(deserializer)?;
-        let cfg = CodecConfig {
-            maximum_shard_size: MAX_SHARD_SIZE,
-        };
-        <Coder as Scheme>::Shard::decode_cfg(bytes.as_slice(), &cfg)
-            .map(Shard)
-            .map_err(serde::de::Error::custom)
-    }
+pub struct CheckedShard {
+    commitment: Commitment,
+    index: usize,
+    bytes: Vec<u8>,
 }
 
 /// Errors returned by the coding layer.
@@ -123,16 +63,15 @@ pub enum Error {
         data_shards: usize,
         parity_shards: usize,
     },
-    /// Fewer than `data_shards` shards were supplied to [`decode`].
+    /// Fewer than `data_shards` distinct shards were supplied to [`decode`].
     NotEnoughShards { have: usize, need: usize },
-    /// Shards disagreed on their length, or a length was odd. The GF(2^16)
-    /// coder reads shards two bytes at a time and requires a uniform, even
-    /// width.
+    /// Shards disagreed on their length, or a length was zero or odd. The
+    /// GF(2^16) coder reads shards two bytes at a time.
     InconsistentShardLength,
     /// The shard did not verify against the commitment at the given index.
     InvalidShard { index: usize },
-    /// Reconstruction produced data that does not hash to the commitment, or
-    /// the coder itself failed.
+    /// Reconstruction produced data that does not match the commitment, or the
+    /// coder itself failed.
     Coding(String),
 }
 
@@ -159,127 +98,119 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// Build a commonware [`Config`] from the `(data, parity)` split the protocols
-/// use.
-fn config(data_shards: usize, parity_shards: usize) -> Result<Config, Error> {
-    let invalid = || Error::InvalidParameters {
-        data_shards,
-        parity_shards,
-    };
-    if data_shards + parity_shards > u16::MAX as usize {
-        return Err(invalid());
+impl From<reed_solomon_simd::Error> for Error {
+    fn from(error: reed_solomon_simd::Error) -> Self {
+        Error::Coding(error.to_string())
     }
-    let minimum_shards =
-        NonZeroU16::new(u16::try_from(data_shards).map_err(|_| invalid())?).ok_or_else(invalid)?;
-    let extra_shards =
-        NonZeroU16::new(u16::try_from(parity_shards).map_err(|_| invalid())?).ok_or_else(invalid)?;
-    Ok(Config {
-        minimum_shards,
-        extra_shards,
-    })
+}
+
+/// Make sure that the coder supports `data_shards + parity_shards`.
+fn check_parameters(data_shards: usize, parity_shards: usize) -> Result<(), Error> {
+    if data_shards == 0
+        || parity_shards == 0
+        || !ReedSolomonEncoder::supports(data_shards, parity_shards)
+    {
+        return Err(Error::InvalidParameters {
+            data_shards,
+            parity_shards,
+        });
+    }
+    Ok(())
+}
+
+/// The shard width for a message of `data_len` bytes: the smallest even width
+/// that holds the 4-byte length prefix and the data in `data_shards` shards.
+fn shard_width(data_len: usize, data_shards: usize) -> usize {
+    let width = (4 + data_len).div_ceil(data_shards);
+    width + width % 2
+}
+
+/// Add the parity shards to `data`, and build the Merkle tree over all
+/// `data_shards + parity_shards` shards.
+fn commit(
+    mut data: Vec<Vec<u8>>,
+    data_shards: usize,
+    parity_shards: usize,
+    hash_state: &HashState,
+) -> Result<(MerkleTree, Vec<Vec<u8>>), Error> {
+    let parity = reed_solomon_simd::encode(data_shards, parity_shards, &data)?;
+    data.extend(parity);
+    let leaves: Vec<Hash> = data.iter().map(|shard| do_hash(shard)).collect();
+    Ok((MerkleTree::new(leaves, hash_state), data))
 }
 
 /// Erasure-code `data` into `data_shards + parity_shards` shards and commit to
 /// them.
 ///
-/// The returned shards are in index order: shard `i` is the one node `i` must
-/// receive, and it will only verify at that index. Any `data_shards` of them
-/// reconstruct the message *exactly* — commonware prefixes the payload with its
-/// length, so unlike the old `get_shards` there is no trailing zero padding for
-/// the caller to strip.
+/// Shard `i` is the shard that node `i` must hold, and it verifies only at
+/// index `i`. Any `data_shards` of them reconstruct the message exactly.
 pub fn encode(
     data: &[u8],
     data_shards: usize,
     parity_shards: usize,
+    hash_state: &HashState,
 ) -> Result<(Commitment, Vec<Shard>), Error> {
-    let config = config(data_shards, parity_shards)?;
-    let (commitment, shards) =
-        Coder::encode(&config, data, &STRATEGY).map_err(|e| Error::Coding(format!("{:?}", e)))?;
-    Ok((commitment.0, shards.into_iter().map(Shard).collect()))
+    check_parameters(data_shards, parity_shards)?;
+    let data_len = u32::try_from(data.len())
+        .map_err(|_| Error::Coding(format!("message of {} bytes is too long", data.len())))?;
+
+    let width = shard_width(data.len(), data_shards);
+    let mut padded = vec![0u8; data_shards * width];
+    padded[..4].copy_from_slice(&data_len.to_be_bytes());
+    padded[4..4 + data.len()].copy_from_slice(data);
+    let originals: Vec<Vec<u8>> = padded.chunks(width).map(<[u8]>::to_vec).collect();
+
+    let (tree, shards) = commit(originals, data_shards, parity_shards, hash_state)?;
+    let shards = shards
+        .into_iter()
+        .enumerate()
+        .map(|(index, bytes)| Shard {
+            bytes,
+            proof: tree.gen_proof(index),
+        })
+        .collect();
+    Ok((tree.root(), shards))
 }
 
-/// The process-wide rayon strategy used by [`encode_parallel`].
+/// Erasure-code a batch of independent messages, one for each recipient.
 ///
-/// Built once. `Rayon::new` constructs its own thread pool, so calling it per
-/// encode would spawn and tear down a pool for every broadcast. `None` means a
-/// pool could not be built, and callers fall back to [`encode`].
-fn parallel_strategy() -> Option<&'static Rayon> {
-    static PARALLEL: OnceLock<Option<Rayon>> = OnceLock::new();
-    PARALLEL
-        .get_or_init(|| Rayon::new(std::thread::available_parallelism().ok()?).ok())
-        .as_ref()
-}
-
-/// [`encode`], with commonware spreading a *single* message's coding across a
-/// rayon pool.
+/// This is the main cost of the AVID dealer: `n` messages, each coded into `n`
+/// shards. The messages are independent, so rayon codes them in parallel.
+/// `result[i]` belongs to `messages[i]`.
 ///
-/// Use this only where a node codes one large message at a time, which is the
-/// dealer in `ctrbc::start_init`. [`encode`] stays [`Sequential`] everywhere
-/// else on purpose: `acs` and `fin_mvba` drive tens of coding instances
-/// concurrently on the tokio runtime, and giving each of those its own pool
-/// oversubscribes the machine rather than speeding any single one up.
-///
-/// Falls back to [`encode`] when no pool can be built.
-pub fn encode_parallel(
-    data: &[u8],
-    data_shards: usize,
-    parity_shards: usize,
-) -> Result<(Commitment, Vec<Shard>), Error> {
-    let Some(strategy) = parallel_strategy() else {
-        return encode(data, data_shards, parity_shards);
-    };
-    let config = config(data_shards, parity_shards)?;
-    let (commitment, shards) =
-        Coder::encode(&config, data, strategy).map_err(|e| Error::Coding(format!("{:?}", e)))?;
-    Ok((commitment.0, shards.into_iter().map(Shard).collect()))
-}
-
-/// Erasure-code a whole batch of independent messages, one per recipient.
-///
-/// This is the dealer's dominant cost in `avid::start_init`: `n` messages, each
-/// coded into `n` shards and committed, so `O(n^2)` shard work per
-/// dissemination. The messages do not depend on each other, so they go straight
-/// onto rayon.
-///
-/// Each individual encode stays [`Sequential`]. The parallelism is *across*
-/// messages, which saturates the pool once rather than nesting a pool inside a
-/// pool.
-///
-/// Results keep input order: `result[i]` belongs to `messages[i]`.
-///
-/// Call [`encode_batch_async`] from async code — this function blocks until the
-/// whole batch is done.
+/// From async code, call [`encode_batch_async`]. This function blocks until
+/// the full batch is done.
 pub fn encode_batch(
     messages: &[Vec<u8>],
     data_shards: usize,
     parity_shards: usize,
+    hash_state: &HashState,
 ) -> Result<Vec<(Commitment, Vec<Shard>)>, Error> {
-    // Validate once up front so a bad split is not reported `n` times over.
-    config(data_shards, parity_shards)?;
+    // Check the split one time, so that a bad split does not give `n` errors.
+    check_parameters(data_shards, parity_shards)?;
     messages
         .par_iter()
-        .map(|message| encode(message, data_shards, parity_shards))
+        .map(|message| encode(message, data_shards, parity_shards, hash_state))
         .collect()
 }
 
-/// [`encode_batch`], run on rayon's pool without blocking the caller.
+/// [`encode_batch`] on the rayon pool, without a block of the caller.
 ///
-/// `par_iter` called directly from an `async fn` does not yield: it injects the
-/// job and then parks the calling thread on a latch, so the tokio worker
-/// running that task is unavailable until the whole batch finishes and the
-/// actor's inbox keeps growing behind it. Handing the batch to `rayon::spawn`
-/// and awaiting a oneshot suspends the future instead, leaving the worker free
-/// to drive other tasks.
+/// `par_iter` in an `async fn` does not yield: it parks the tokio worker until
+/// the full batch is done. `rayon::spawn` and a oneshot channel let the future
+/// wait instead, so the worker can run other tasks. `rayon::spawn` needs a
+/// `'static` closure, thus this function takes its own `HashState`.
 pub async fn encode_batch_async(
     messages: Vec<Vec<u8>>,
     data_shards: usize,
     parity_shards: usize,
+    hash_state: HashState,
 ) -> Result<Vec<(Commitment, Vec<Shard>)>, Error> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     rayon::spawn(move || {
-        // A send failure only means the receiver was dropped, i.e. the awaiting
-        // task went away; there is nothing to do about it here.
-        let _ = tx.send(encode_batch(&messages, data_shards, parity_shards));
+        // A send fails only if the waiting task stopped. Then nobody needs the
+        // result.
+        let _ = tx.send(encode_batch(&messages, data_shards, parity_shards, &hash_state));
     });
     rx.await.unwrap_or_else(|_| {
         Err(Error::Coding(
@@ -290,244 +221,270 @@ pub async fn encode_batch_async(
 
 /// Verify `shard` against `commitment` at `index`.
 ///
-/// `index` is the position the shard was encoded at, which for every protocol
-/// here is the identity of the node that is supposed to hold it. Verifying a
-/// shard at the wrong index fails, so this also authenticates the sender's
-/// claim to that position.
+/// `index` is the position of the shard in the encoding. In all protocols here,
+/// this is the identity of the node that holds the shard. A shard verifies at
+/// one index only, so this also authenticates the claim of the sender to that
+/// position.
 pub fn check(
     commitment: &Commitment,
     index: usize,
     shard: &Shard,
     data_shards: usize,
     parity_shards: usize,
+    hash_state: &HashState,
 ) -> Result<CheckedShard, Error> {
-    let config = config(data_shards, parity_shards)?;
-    let index = u16::try_from(index).map_err(|_| Error::InvalidShard { index })?;
-    Coder::check(&config, &Sha256Digest(*commitment), index, &shard.0)
-        .map_err(|_| Error::InvalidShard {
-            index: index as usize,
+    check_parameters(data_shards, parity_shards)?;
+    let invalid = Error::InvalidShard { index };
+    let total = data_shards + parity_shards;
+    if index >= total {
+        return Err(invalid);
+    }
+
+    // The tree has one level for each halving of `total`, rounded up. A proof
+    // with a different shape can cause `Proof::validate` to panic, thus check
+    // the shape first.
+    let mut depth = 0;
+    let mut width = total;
+    while width > 1 {
+        width = width.div_ceil(2);
+        depth += 1;
+    }
+    let path = shard.proof.path();
+    if path.len() != depth || shard.proof.lemma().len() != depth + 2 {
+        return Err(invalid);
+    }
+
+    // The path gives the position of the leaf: `true` at level `l` means that
+    // bit `l` of the position is zero.
+    let position = path
+        .iter()
+        .enumerate()
+        .fold(0usize, |position, (level, is_left)| position | ((!is_left as usize) << level));
+    if position != index
+        || shard.proof.root() != *commitment
+        || shard.proof.item() != do_hash(&shard.bytes)
+        || !shard.proof.validate(hash_state)
+    {
+        return Err(invalid);
+    }
+
+    Ok(CheckedShard {
+        commitment: *commitment,
+        index,
+        bytes: shard.bytes.clone(),
+    })
+}
+
+/// Reconstruct the message and all shards from at least `data_shards` verified
+/// shards, and make sure that they match `commitment`.
+fn reconstruct<'a, I>(
+    commitment: &Commitment,
+    shards: I,
+    data_shards: usize,
+    parity_shards: usize,
+    hash_state: &HashState,
+) -> Result<(Vec<u8>, MerkleTree, Vec<Vec<u8>>), Error>
+where
+    I: IntoIterator<Item = &'a CheckedShard>,
+{
+    check_parameters(data_shards, parity_shards)?;
+
+    // Two shards checked at the same index under one commitment have the same
+    // bytes, so a repeated index adds nothing.
+    let mut by_index: BTreeMap<usize, &[u8]> = BTreeMap::new();
+    for shard in shards {
+        if shard.commitment != *commitment {
+            return Err(Error::InvalidShard { index: shard.index });
+        }
+        by_index.entry(shard.index).or_insert(&shard.bytes);
+    }
+    if by_index.len() < data_shards {
+        return Err(Error::NotEnoughShards {
+            have: by_index.len(),
+            need: data_shards,
+        });
+    }
+    let width = by_index.values().next().map_or(0, |bytes| bytes.len());
+    if width == 0 || width % 2 != 0 || by_index.values().any(|bytes| bytes.len() != width) {
+        return Err(Error::InconsistentShardLength);
+    }
+
+    let restored = if (0..data_shards).all(|index| by_index.contains_key(&index)) {
+        BTreeMap::new()
+    } else {
+        reed_solomon_simd::decode(
+            data_shards,
+            parity_shards,
+            by_index.range(..data_shards).map(|(index, bytes)| (*index, *bytes)),
+            by_index.range(data_shards..).map(|(index, bytes)| (index - data_shards, *bytes)),
+        )?
+    };
+    let originals: Vec<Vec<u8>> = (0..data_shards)
+        .map(|index| match by_index.get(&index) {
+            Some(bytes) => bytes.to_vec(),
+            None => restored[&index].clone(),
         })
+        .collect();
+
+    // A dealer can commit to shards that are not one codeword. Then different
+    // sets of shards decode to different messages. Encode the data shards
+    // again and compare the root, so that all honest nodes get the same
+    // message or an error.
+    let (tree, all_shards) = commit(originals, data_shards, parity_shards, hash_state)?;
+    if tree.root() != *commitment {
+        return Err(Error::Coding(
+            "the decoded shards do not match the commitment".to_string(),
+        ));
+    }
+
+    // Accept only the layout that `encode` makes, so that one commitment gives
+    // at most one message.
+    let layout = all_shards[..data_shards].concat();
+    let data_len = u32::from_be_bytes([layout[0], layout[1], layout[2], layout[3]]) as usize;
+    if 4 + data_len > layout.len()
+        || layout[4 + data_len..].iter().any(|byte| *byte != 0)
+        || shard_width(data_len, data_shards) != width
+    {
+        return Err(Error::Coding(
+            "the decoded shards do not have the canonical layout".to_string(),
+        ));
+    }
+    Ok((layout[4..4 + data_len].to_vec(), tree, all_shards))
 }
 
 /// Reconstruct the message from at least `data_shards` verified shards.
 ///
-/// commonware re-derives the commitment as part of decoding and rejects the
-/// result if it does not match, so a successful return means the message is
-/// bound to `commitment` — the explicit "rebuild the Merkle tree and compare
-/// roots" step the protocols used to perform is now redundant.
+/// A successful return means that the message is bound to `commitment`.
 pub fn decode<'a, I>(
     commitment: &Commitment,
     shards: I,
     data_shards: usize,
     parity_shards: usize,
+    hash_state: &HashState,
 ) -> Result<Vec<u8>, Error>
 where
     I: IntoIterator<Item = &'a CheckedShard>,
 {
-    let config = config(data_shards, parity_shards)?;
-    Coder::decode(
-        &config,
-        &Sha256Digest(*commitment),
-        shards.into_iter(),
-        &STRATEGY,
-    )
-    .map_err(|e| Error::Coding(format!("{:?}", e)))
+    reconstruct(commitment, shards, data_shards, parity_shards, hash_state)
+        .map(|(message, _, _)| message)
 }
 
-/// Reconstruct the message *and* regenerate every shard.
+/// Reconstruct the message *and* all shards with their proofs.
 ///
-/// Decoding only yields the message, but a node that reconstructs during the
-/// ECHO or READY phase must then forward its own shard, which it may never have
-/// received. Encoding is deterministic, so re-encoding the decoded message
-/// reproduces exactly the shards the dealer sent; this asserts that by checking
-/// the regenerated commitment.
+/// A node that reconstructs during the ECHO or READY phase must then send its
+/// own shard, which it possibly did not receive. The shards are the same
+/// shards that the dealer made.
 pub fn decode_with_shards<'a, I>(
     commitment: &Commitment,
     shards: I,
     data_shards: usize,
     parity_shards: usize,
+    hash_state: &HashState,
 ) -> Result<(Vec<u8>, Vec<Shard>), Error>
 where
     I: IntoIterator<Item = &'a CheckedShard>,
 {
-    let message = decode(commitment, shards, data_shards, parity_shards)?;
-    let (regenerated, shards) = encode(&message, data_shards, parity_shards)?;
-    if regenerated != *commitment {
-        return Err(Error::Coding(
-            "re-encoding the decoded message produced a different commitment".to_string(),
-        ));
-    }
+    let (message, tree, all_shards) =
+        reconstruct(commitment, shards, data_shards, parity_shards, hash_state)?;
+    let shards = all_shards
+        .into_iter()
+        .enumerate()
+        .map(|(index, bytes)| Shard {
+            bytes,
+            proof: tree.gen_proof(index),
+        })
+        .collect();
     Ok((message, shards))
 }
 
-/// The bare Reed-Solomon coder, with no commitment attached.
+/// The bare Reed-Solomon coder, with no commitment.
 ///
-/// Same signatures as the `reed-solomon-erasure` helpers this replaces, so that
-/// protocols which build their own commitment over the shards (`ccbrb` commits
-/// to the vector of shard hashes rather than to a Merkle root) keep working
-/// unchanged. Prefer the committed layer above for anything new: it produces
-/// inclusion proofs for free and verifies reconstruction against the
-/// commitment.
+/// `ccbrb` and `ecc_rbc` commit to the vector of shard hashes, not to a Merkle
+/// root, so they use this layer. For new code, use the committed layer above.
 pub mod raw {
-    use super::Error;
-    use commonware_cryptography::reed_solomon::{Decoder, Encoder};
+    use super::{check_parameters, Error};
 
-    /// Round `width` up to the even width the GF(2^16) coder requires.
-    fn even(width: usize) -> usize {
-        if width % 2 == 0 {
-            width
-        } else {
-            width + 1
-        }
-    }
-
-    /// Split `data` into `data_shards` zero-padded shards and append
-    /// `parity_shards` recovery shards.
+    /// Split `data` into `data_shards` zero-padded shards and add
+    /// `parity_shards` parity shards.
     ///
-    /// The message length is *not* recorded, matching the previous behaviour:
-    /// concatenating the first `data_shards` shards yields the message followed
-    /// by zero padding, and callers are responsible for knowing where it ends.
+    /// The message length is *not* recorded: the first `data_shards` shards
+    /// hold the message and then zero padding. The caller must know where the
+    /// message stops.
     pub fn get_shards(
         data: Vec<u8>,
         data_shards: usize,
         parity_shards: usize,
     ) -> Result<Vec<Vec<u8>>, Error> {
-        if data_shards == 0 || parity_shards == 0 || !Encoder::supports(data_shards, parity_shards)
-        {
-            return Err(Error::InvalidParameters {
-                data_shards,
-                parity_shards,
-            });
-        }
-        let width = even((data.len() / data_shards) + 1);
+        check_parameters(data_shards, parity_shards)?;
+        let width = data.len() / data_shards + 1;
+        let width = width + width % 2;
 
-        let mut shards: Vec<Vec<u8>> = Vec::with_capacity(data_shards + parity_shards);
-        for i in 0..data_shards {
-            let start = (i * width).min(data.len());
-            let end = ((i + 1) * width).min(data.len());
-            let mut shard = Vec::with_capacity(width);
-            shard.extend_from_slice(&data[start..end]);
-            shard.resize(width, 0);
-            shards.push(shard);
-        }
-
-        let mut encoder = Encoder::new(data_shards, parity_shards, width)
-            .map_err(|e| Error::Coding(format!("{:?}", e)))?;
-        for shard in shards.iter() {
-            encoder
-                .add_original_shard(shard)
-                .map_err(|e| Error::Coding(format!("{:?}", e)))?;
-        }
-        let result = encoder
-            .encode()
-            .map_err(|e| Error::Coding(format!("{:?}", e)))?;
-        for recovery in result.recovery_iter() {
-            shards.push(recovery.to_vec());
-        }
-        drop(result);
-
+        let mut padded = data;
+        padded.resize(data_shards * width, 0);
+        let mut shards: Vec<Vec<u8>> = padded.chunks(width).map(<[u8]>::to_vec).collect();
+        let parity = reed_solomon_simd::encode(data_shards, parity_shards, &shards)?;
+        shards.extend(parity);
         Ok(shards)
     }
 
-    /// Fill in every missing shard of `data` in place.
+    /// Fill in each missing shard of `data` in place.
     ///
-    /// `data` must have exactly `data_shards + parity_shards` slots, at least
-    /// `data_shards` of which are present and all of the same even length.
-    /// Both the missing data shards and the missing parity shards are
-    /// regenerated, as the previous implementation did.
+    /// `data` must have `data_shards + parity_shards` slots. At least
+    /// `data_shards` of them must be present, all with the same even length.
+    /// This function makes the missing data shards and the missing parity
+    /// shards again.
     pub fn reconstruct_data(
         data: &mut Vec<Option<Vec<u8>>>,
         data_shards: usize,
         parity_shards: usize,
     ) -> Result<(), Error> {
-        let total = data_shards + parity_shards;
-        if data_shards == 0 || parity_shards == 0 || data.len() != total {
+        check_parameters(data_shards, parity_shards)?;
+        if data.len() != data_shards + parity_shards {
             return Err(Error::InvalidParameters {
                 data_shards,
                 parity_shards,
             });
         }
 
-        let width = match data.iter().flatten().next() {
-            Some(shard) => shard.len(),
-            None => {
-                return Err(Error::NotEnoughShards {
-                    have: 0,
-                    need: data_shards,
-                })
-            }
-        };
-        if width == 0 || width % 2 != 0 || data.iter().flatten().any(|s| s.len() != width) {
-            return Err(Error::InconsistentShardLength);
-        }
-
-        let present = data.iter().filter(|s| s.is_some()).count();
+        let present = data.iter().flatten().count();
         if present < data_shards {
             return Err(Error::NotEnoughShards {
                 have: present,
                 need: data_shards,
             });
         }
+        let width = data.iter().flatten().next().map_or(0, |shard| shard.len());
+        if width == 0 || width % 2 != 0 || data.iter().flatten().any(|s| s.len() != width) {
+            return Err(Error::InconsistentShardLength);
+        }
 
-        // Reconstruct the missing data shards, if any are missing.
         if data[..data_shards].iter().any(|s| s.is_none()) {
-            let mut decoder = Decoder::new(data_shards, parity_shards, width)
-                .map_err(|e| Error::Coding(format!("{:?}", e)))?;
-            for (index, shard) in data.iter().enumerate() {
-                let Some(shard) = shard else { continue };
-                let outcome = if index < data_shards {
-                    decoder.add_original_shard(index, shard)
-                } else {
-                    decoder.add_recovery_shard(index - data_shards, shard)
-                };
-                outcome.map_err(|e| Error::Coding(format!("{:?}", e)))?;
-            }
-            let result = decoder
-                .decode_with_recovery()
-                .map_err(|e| Error::Coding(format!("{:?}", e)))?;
-            if let Some(result) = result {
-                for index in 0..data_shards {
-                    if data[index].is_none() {
-                        let shard = result.original(index).ok_or(Error::NotEnoughShards {
-                            have: present,
-                            need: data_shards,
-                        })?;
-                        data[index] = Some(shard.to_vec());
-                    }
-                }
-                for index in 0..parity_shards {
-                    if data[data_shards + index].is_none() {
-                        if let Some(shard) = result.recovery(index) {
-                            data[data_shards + index] = Some(shard.to_vec());
-                        }
-                    }
-                }
+            let restored = reed_solomon_simd::decode(
+                data_shards,
+                parity_shards,
+                data[..data_shards]
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, s)| s.as_ref().map(|s| (index, s))),
+                data[data_shards..]
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, s)| s.as_ref().map(|s| (index, s))),
+            )?;
+            for (index, shard) in restored {
+                data[index] = Some(shard);
             }
         }
 
-        // Every data shard is present now; regenerate any parity shard that is
-        // still missing. `decode` skips this work when nothing had to be
-        // reconstructed, so it is not always covered above.
         if data[data_shards..].iter().any(|s| s.is_none()) {
-            let mut encoder = Encoder::new(data_shards, parity_shards, width)
-                .map_err(|e| Error::Coding(format!("{:?}", e)))?;
-            for index in 0..data_shards {
-                let shard = data[index].as_ref().ok_or(Error::NotEnoughShards {
-                    have: present,
-                    need: data_shards,
-                })?;
-                encoder
-                    .add_original_shard(shard)
-                    .map_err(|e| Error::Coding(format!("{:?}", e)))?;
-            }
-            let result = encoder
-                .encode()
-                .map_err(|e| Error::Coding(format!("{:?}", e)))?;
-            let recovery: Vec<Vec<u8>> = result.recovery_iter().map(|s| s.to_vec()).collect();
-            drop(result);
-            for (index, shard) in recovery.into_iter().enumerate() {
-                if data[data_shards + index].is_none() {
-                    data[data_shards + index] = Some(shard);
+            let parity = reed_solomon_simd::encode(
+                data_shards,
+                parity_shards,
+                data[..data_shards].iter().flatten(),
+            )?;
+            for (slot, shard) in data[data_shards..].iter_mut().zip(parity) {
+                if slot.is_none() {
+                    *slot = Some(shard);
                 }
             }
         }
@@ -546,21 +503,24 @@ mod tests {
         (n - 2 * f, 2 * f)
     }
 
-    /// `encode_parallel` hands commonware a rayon pool instead of `Sequential`.
-    /// The strategy is a scheduling choice, so the shards and the commitment it
-    /// produces must be byte-identical to the sequential ones.
-    #[test]
-    fn parallel_encoding_matches_sequential_encoding() {
-        for n in [4usize, 7, 16, 64] {
-            let (k, m) = split(n);
-            let message: Vec<u8> = (0..9000u32).map(|i| (i % 251) as u8).collect();
+    fn hash_state() -> HashState {
+        HashState::new([1u8; 16], [2u8; 16], [3u8; 16])
+    }
 
-            let (sequential_commitment, sequential_shards) = encode(&message, k, m).unwrap();
-            let (parallel_commitment, parallel_shards) = encode_parallel(&message, k, m).unwrap();
-
-            assert_eq!(parallel_commitment, sequential_commitment, "n={}", n);
-            assert_eq!(parallel_shards, sequential_shards, "n={}", n);
-        }
+    /// Commit to `shards` as they are, with proofs. A malicious dealer can do
+    /// this with shards that are not one codeword.
+    fn commit_as_dealer(shards: &[Vec<u8>], hs: &HashState) -> (Commitment, Vec<Shard>) {
+        let leaves: Vec<Hash> = shards.iter().map(|shard| do_hash(shard)).collect();
+        let tree = MerkleTree::new(leaves, hs);
+        let shards = shards
+            .iter()
+            .enumerate()
+            .map(|(index, bytes)| Shard {
+                bytes: bytes.clone(),
+                proof: tree.gen_proof(index),
+            })
+            .collect();
+        (tree.root(), shards)
     }
 
     /// The batch encoder is the AVID dealer's path. It must agree with encoding
@@ -568,6 +528,7 @@ mod tests {
     /// encoding is recovered by position.
     #[test]
     fn batch_encoding_matches_sequential_encoding_and_keeps_order() {
+        let hs = hash_state();
         for n in [4usize, 7, 16] {
             let (k, m) = split(n);
             // Distinct lengths and contents, so a reordering cannot go unnoticed.
@@ -577,26 +538,20 @@ mod tests {
 
             let expected: Vec<(Commitment, Vec<Shard>)> = messages
                 .iter()
-                .map(|message| encode(message, k, m).unwrap())
+                .map(|message| encode(message, k, m, &hs).unwrap())
                 .collect();
-            let batched = encode_batch(&messages, k, m).unwrap();
-
-            assert_eq!(batched.len(), messages.len(), "n={}", n);
-            for (index, (batch_entry, expected_entry)) in
-                batched.iter().zip(expected.iter()).enumerate()
-            {
-                assert_eq!(batch_entry.0, expected_entry.0, "n={} index={}", n, index);
-                assert_eq!(batch_entry.1, expected_entry.1, "n={} index={}", n, index);
-            }
+            let batched = encode_batch(&messages, k, m, &hs).unwrap();
+            assert_eq!(batched, expected, "n={}", n);
         }
     }
 
     /// A bad split is reported once for the batch, not once per message.
     #[test]
     fn batch_encoding_rejects_a_bad_split() {
+        let hs = hash_state();
         let messages = vec![vec![1u8; 64], vec![2u8; 64]];
-        assert!(encode_batch(&messages, 0, 3).is_err());
-        assert!(encode_batch(&messages, 3, 0).is_err());
+        assert!(encode_batch(&messages, 0, 3, &hs).is_err());
+        assert!(encode_batch(&messages, 3, 0, &hs).is_err());
     }
 
     /// The async bridge exists so the tokio worker is not parked on a rayon
@@ -609,14 +564,9 @@ mod tests {
             .map(|j| (0..(800 + 11 * j) as u32).map(|i| (i % 244) as u8).collect())
             .collect();
 
-        let blocking = encode_batch(&messages, k, m).unwrap();
-        let bridged = encode_batch_async(messages, k, m).await.unwrap();
-
-        assert_eq!(bridged.len(), blocking.len());
-        for (bridged_entry, blocking_entry) in bridged.iter().zip(blocking.iter()) {
-            assert_eq!(bridged_entry.0, blocking_entry.0);
-            assert_eq!(bridged_entry.1, blocking_entry.1);
-        }
+        let blocking = encode_batch(&messages, k, m, &hash_state()).unwrap();
+        let bridged = encode_batch_async(messages, k, m, hash_state()).await.unwrap();
+        assert_eq!(bridged, blocking);
     }
 
     /// An empty batch is legal: an AVID dealer with nothing to send must not be
@@ -624,15 +574,16 @@ mod tests {
     #[test]
     fn an_empty_batch_encodes_to_nothing() {
         let (k, m) = split(4);
-        assert!(encode_batch(&[], k, m).unwrap().is_empty());
+        assert!(encode_batch(&[], k, m, &hash_state()).unwrap().is_empty());
     }
 
     #[test]
     fn committed_round_trip_from_the_last_k_shards() {
+        let hs = hash_state();
         for n in [4usize, 7, 16, 64] {
             let (k, m) = split(n);
             let message: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
-            let (commitment, shards) = encode(&message, k, m).unwrap();
+            let (commitment, shards) = encode(&message, k, m, &hs).unwrap();
             assert_eq!(shards.len(), n);
 
             // Verify every shard, then decode from the *last* k, so that at
@@ -641,13 +592,12 @@ mod tests {
             let checked: Vec<CheckedShard> = shards
                 .iter()
                 .enumerate()
-                .map(|(i, s)| check(&commitment, i, s, k, m).unwrap())
+                .map(|(i, s)| check(&commitment, i, s, k, m, &hs).unwrap())
                 .collect();
             let survivors = &checked[n - k..];
-            assert!(survivors.iter().count() == k);
 
             let (decoded, regenerated) =
-                decode_with_shards(&commitment, survivors.iter(), k, m).unwrap();
+                decode_with_shards(&commitment, survivors.iter(), k, m, &hs).unwrap();
             assert_eq!(decoded, message, "n={}", n);
             assert_eq!(regenerated, shards, "n={}", n);
         }
@@ -658,25 +608,183 @@ mod tests {
     /// have, so the common path supplies more shards than are strictly needed.
     #[test]
     fn decoding_with_more_than_k_shards_is_accepted() {
+        let hs = hash_state();
         for n in [4usize, 7, 16, 64] {
             let (k, m) = split(n);
             let f = (n - 1) / 3;
             let message: Vec<u8> = (0..4096u32).map(|i| (i % 253) as u8).collect();
-            let (commitment, shards) = encode(&message, k, m).unwrap();
+            let (commitment, shards) = encode(&message, k, m, &hs).unwrap();
 
-            // The n-f shards a node would hold after the ECHO phase, taken
-            // from the top of the range so parity shards are involved.
             let survivors: Vec<CheckedShard> = shards
                 .iter()
                 .enumerate()
                 .skip(f)
-                .map(|(i, s)| check(&commitment, i, s, k, m).unwrap())
+                .map(|(i, s)| check(&commitment, i, s, k, m, &hs).unwrap())
                 .collect();
-            assert_eq!(survivors.len(), n - f);
             assert!(survivors.len() > k, "n={} would not exercise the extras", n);
 
-            let decoded = decode(&commitment, survivors.iter(), k, m).unwrap();
+            let decoded = decode(&commitment, survivors.iter(), k, m, &hs).unwrap();
             assert_eq!(decoded, message, "n={}", n);
+        }
+    }
+
+    #[test]
+    fn decoding_with_fewer_than_k_shards_fails() {
+        let hs = hash_state();
+        let (k, m) = split(16);
+        let (commitment, shards) = encode(b"too few survivors", k, m, &hs).unwrap();
+        let checked: Vec<CheckedShard> = shards
+            .iter()
+            .enumerate()
+            .take(k - 1)
+            .map(|(i, s)| check(&commitment, i, s, k, m, &hs).unwrap())
+            .collect();
+        // A repeated shard does not count twice.
+        let repeated = checked.iter().chain(checked.first());
+        assert!(matches!(
+            decode(&commitment, repeated, k, m, &hs),
+            Err(Error::NotEnoughShards { .. })
+        ));
+    }
+
+    #[test]
+    fn a_shard_only_verifies_at_its_own_index() {
+        let hs = hash_state();
+        for n in [4usize, 7, 16, 64] {
+            let (k, m) = split(n);
+            let (commitment, shards) = encode(b"authenticated position", k, m, &hs).unwrap();
+            for (index, shard) in shards.iter().enumerate() {
+                for claimed in 0..n + 1 {
+                    assert_eq!(
+                        check(&commitment, claimed, shard, k, m, &hs).is_ok(),
+                        claimed == index,
+                        "n={} shard={} claimed={}",
+                        n,
+                        index,
+                        claimed
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_shard_from_another_message_is_rejected() {
+        let hs = hash_state();
+        let (k, m) = split(16);
+        let (commitment, shards) = encode(b"the real message", k, m, &hs).unwrap();
+        let (other_commitment, other) = encode(b"a different message", k, m, &hs).unwrap();
+        assert!(check(&commitment, 0, &other[0], k, m, &hs).is_err());
+
+        // A shard checked against another commitment cannot join a decode.
+        let mut checked: Vec<CheckedShard> = shards
+            .iter()
+            .enumerate()
+            .map(|(i, s)| check(&commitment, i, s, k, m, &hs).unwrap())
+            .collect();
+        checked[0] = check(&other_commitment, 0, &other[0], k, m, &hs).unwrap();
+        assert!(decode(&commitment, checked.iter(), k, m, &hs).is_err());
+    }
+
+    /// A malformed proof from the network must give an error, not a panic in
+    /// `Proof::validate`.
+    #[test]
+    fn a_malformed_proof_is_rejected() {
+        let hs = hash_state();
+        let (k, m) = split(16);
+        let (commitment, shards) = encode(b"proof shape", k, m, &hs).unwrap();
+        let lemma = shards[0].proof.lemma().to_vec();
+        let path = shards[0].proof.path().to_vec();
+        for proof in [
+            Proof::new(lemma.clone(), path[1..].to_vec()),
+            Proof::new(lemma[1..].to_vec(), path.clone()),
+            Proof::new(vec![], vec![]),
+        ] {
+            let shard = Shard {
+                bytes: shards[0].bytes.clone(),
+                proof,
+            };
+            assert!(check(&commitment, 0, &shard, k, m, &hs).is_err());
+        }
+    }
+
+    /// A dealer that commits to shards which are not one codeword must not make
+    /// two honest nodes decode two different messages: every subset fails.
+    #[test]
+    fn a_commitment_to_a_non_codeword_does_not_decode() {
+        let hs = hash_state();
+        let (k, m) = split(16);
+        let (_, honest) = encode(&[5u8; 300], k, m, &hs).unwrap();
+        let mut bytes: Vec<Vec<u8>> = honest.into_iter().map(|s| s.bytes).collect();
+        bytes[k][0] ^= 1;
+        let (commitment, shards) = commit_as_dealer(&bytes, &hs);
+
+        let checked: Vec<CheckedShard> = shards
+            .iter()
+            .enumerate()
+            .map(|(i, s)| check(&commitment, i, s, k, m, &hs).unwrap())
+            .collect();
+        assert!(decode(&commitment, checked[..k].iter(), k, m, &hs).is_err());
+        assert!(decode(&commitment, checked[m..].iter(), k, m, &hs).is_err());
+    }
+
+    /// One commitment decodes to at most one message: a codeword with other
+    /// padding or another width is rejected.
+    #[test]
+    fn a_non_canonical_layout_does_not_decode() {
+        let hs = hash_state();
+        let (k, m) = split(7);
+        let message = [9u8; 10];
+        let width = shard_width(message.len(), k);
+
+        let mut canonical = vec![0u8; k * width];
+        canonical[..4].copy_from_slice(&(message.len() as u32).to_be_bytes());
+        canonical[4..4 + message.len()].copy_from_slice(&message);
+
+        let mut dirty_padding = canonical.clone();
+        *dirty_padding.last_mut().unwrap() = 1;
+        let mut too_wide = canonical.clone();
+        too_wide.resize(k * (width + 2), 0);
+
+        for (layout, shard_len) in [(dirty_padding, width), (too_wide, width + 2)] {
+            let originals: Vec<Vec<u8>> = layout.chunks(shard_len).map(<[u8]>::to_vec).collect();
+            let (_, all) = commit(originals, k, m, &hs).unwrap();
+            let (commitment, shards) = commit_as_dealer(&all, &hs);
+            let checked: Vec<CheckedShard> = shards
+                .iter()
+                .enumerate()
+                .map(|(i, s)| check(&commitment, i, s, k, m, &hs).unwrap())
+                .collect();
+            assert!(decode(&commitment, checked.iter(), k, m, &hs).is_err());
+        }
+    }
+
+    #[test]
+    fn shards_survive_the_serde_wire() {
+        let hs = hash_state();
+        let (k, m) = split(16);
+        let (commitment, shards) = encode(b"over the wire", k, m, &hs).unwrap();
+        for (index, shard) in shards.iter().enumerate() {
+            let bytes = bincode::serialize(shard).unwrap();
+            let restored: Shard = bincode::deserialize(&bytes).unwrap();
+            assert_eq!(&restored, shard);
+            check(&commitment, index, &restored, k, m, &hs).unwrap();
+        }
+    }
+
+    #[test]
+    fn empty_and_tiny_messages_round_trip() {
+        let hs = hash_state();
+        let (k, m) = split(16);
+        for message in [vec![], vec![7u8], vec![9u8; 3]] {
+            let (commitment, shards) = encode(&message, k, m, &hs).unwrap();
+            let checked: Vec<CheckedShard> = shards
+                .iter()
+                .enumerate()
+                .map(|(i, s)| check(&commitment, i, s, k, m, &hs).unwrap())
+                .collect();
+            let decoded = decode(&commitment, checked[m..].iter(), k, m, &hs).unwrap();
+            assert_eq!(decoded, message);
         }
     }
 
@@ -697,49 +805,6 @@ mod tests {
         let mut flat = restored[0].clone();
         flat.truncate(message.len());
         assert_eq!(flat, message);
-    }
-
-    #[test]
-    fn a_shard_only_verifies_at_its_own_index() {
-        let (k, m) = split(16);
-        let (commitment, shards) = encode(b"authenticated position", k, m).unwrap();
-        assert!(check(&commitment, 3, &shards[3], k, m).is_ok());
-        assert!(check(&commitment, 4, &shards[3], k, m).is_err());
-    }
-
-    #[test]
-    fn a_shard_from_another_message_is_rejected() {
-        let (k, m) = split(16);
-        let (commitment, _) = encode(b"the real message", k, m).unwrap();
-        let (_, other) = encode(b"a different message", k, m).unwrap();
-        assert!(check(&commitment, 0, &other[0], k, m).is_err());
-    }
-
-    #[test]
-    fn shards_survive_the_serde_wire() {
-        let (k, m) = split(16);
-        let (commitment, shards) = encode(b"over the wire", k, m).unwrap();
-        for (index, shard) in shards.iter().enumerate() {
-            let bytes = bincode::serialize(shard).unwrap();
-            let restored: Shard = bincode::deserialize(&bytes).unwrap();
-            assert_eq!(&restored, shard);
-            check(&commitment, index, &restored, k, m).unwrap();
-        }
-    }
-
-    #[test]
-    fn empty_and_tiny_messages_round_trip() {
-        let (k, m) = split(16);
-        for message in [vec![], vec![7u8], vec![9u8; 3]] {
-            let (commitment, shards) = encode(&message, k, m).unwrap();
-            let checked: Vec<CheckedShard> = shards
-                .iter()
-                .enumerate()
-                .map(|(i, s)| check(&commitment, i, s, k, m).unwrap())
-                .collect();
-            let decoded = decode(&commitment, checked[m..].iter(), k, m).unwrap();
-            assert_eq!(decoded, message);
-        }
     }
 
     #[test]

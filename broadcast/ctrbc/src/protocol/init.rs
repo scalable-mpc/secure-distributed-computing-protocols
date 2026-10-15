@@ -20,10 +20,7 @@ impl Context {
     // Dealer sending message to everybody
     pub async fn start_init(self: &mut Context, msg:Vec<u8>, instance_id:usize) {
         let (data_shards, parity_shards) = self.coding_split();
-        // The dealer codes one message here, so this is the one call site that
-        // hands commonware a rayon pool: there is no batch to spread across
-        // cores, only the single encode to split up. Receivers stay sequential.
-        let (commitment, shards) = match consensus::encode(&msg, data_shards, parity_shards) {
+        let (commitment, shards) = match consensus::encode(&msg, data_shards, parity_shards, &self.hash_context) {
             Ok(encoding) => encoding,
             Err(error) => {
                 log::error!("Failed to erasure code the broadcast message: {}", error);
@@ -59,7 +56,7 @@ impl Context {
         // self.start_echo(msg.content.clone()).await;
         // The dealer sends each node the shard at that node's own index, so
         // this is the position the shard has to verify at.
-        if msg.verify(self.myid, self.num_nodes, self.num_faults).is_none() {
+        if msg.verify(self.myid, self.num_nodes, self.num_faults, &self.hash_context).is_none() {
             log::error!(
                 "Invalid shard sent by node {}, abandoning RBC",
                 msg.origin
