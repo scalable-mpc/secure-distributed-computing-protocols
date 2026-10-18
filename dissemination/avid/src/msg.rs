@@ -10,7 +10,7 @@ use types::{Replica};
 
 /// One party's fragment of one recipient's message.
 ///
-/// There are two commitment layers. `commitment` is commonware's Merkle root
+/// There are two commitment layers. `commitment` is the Merkle root
 /// over the shards of a single recipient's message, and `shard` carries its own
 /// inclusion proof against it. `master_proof` then places that commitment in
 /// the dealer's master tree over all recipients, so a single master root
@@ -48,6 +48,7 @@ impl AVIDShard{
             &self.shard,
             num_nodes - 2 * num_faults,
             2 * num_faults,
+            hash_state,
         )
         .ok()
     }

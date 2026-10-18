@@ -126,7 +126,7 @@ impl Context{
         // Broadcast commitment
         //
         // Every honest node derives the same `roots` vector from the dealer's
-        // shares, and commonware's encoding is deterministic, so they all
+        // shares, and the encoding is deterministic, so they all
         // arrive at the same commitment and the same shards without any
         // coordination.
         let comm_ser = bincode::serialize(&roots).unwrap();
@@ -134,6 +134,7 @@ impl Context{
             &comm_ser,
             self.num_nodes - 2 * self.num_faults,
             2 * self.num_faults,
+            &self.hash_context,
         ) {
             Ok(encoding) => encoding,
             Err(error) => {

@@ -22,7 +22,7 @@ impl Context {
             // RBC Context already terminated, skip processing this message
         }
         // check if verifies
-        let checked_shard = match msg.verify(ready_sender, self.num_nodes, self.num_faults) {
+        let checked_shard = match msg.verify(ready_sender, self.num_nodes, self.num_faults, &self.hash_context) {
             Some(shard) => shard,
             None => {
                 log::error!(
@@ -72,7 +72,7 @@ impl Context {
 
             let (message, my_share) = match cached {
                 Some(shard) => {
-                    match consensus::decode(&root, checked.iter(), data_shards, parity_shards) {
+                    match consensus::decode(&root, checked.iter(), data_shards, parity_shards, &self.hash_context) {
                         Ok(message) => (message, shard),
                         Err(error) => {
                             log::error!("FATAL: Error reconstructing the broadcast message: {}", error);
@@ -86,6 +86,7 @@ impl Context {
                         checked.iter(),
                         data_shards,
                         parity_shards,
+                        &self.hash_context,
                     ) {
                         Ok((message, shards)) => (message, shards[self.myid].clone()),
                         Err(error) => {
@@ -102,6 +103,7 @@ impl Context {
                 &my_share,
                 data_shards,
                 parity_shards,
+                &self.hash_context,
             ) {
                 Ok(shard) => shard,
                 Err(error) => {
