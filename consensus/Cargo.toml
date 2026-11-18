@@ -17,6 +17,9 @@ bytes = "1.0"
 tokio-util = "0.6"
 tokio-stream = "0.1"
 serde = "1.0.70"
+# Shard bytes as one byte string: bincode writes the same bytes, but much faster
+# than element by element.
+serde_bytes = "0.11"
 serde_json = "1.0" # For JSON serialization
 log="*"
 priority-queue="1"

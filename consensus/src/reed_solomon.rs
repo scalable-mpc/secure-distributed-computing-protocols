@@ -39,6 +39,10 @@ pub type Commitment = Hash;
 /// against the [`Commitment`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Shard {
+    // `serde_bytes`: serialized as one byte string. For bincode this gives the
+    // same bytes as a `Vec<u8>` (an 8-byte length, then the bytes), without one
+    // serializer call for each byte.
+    #[serde(with = "serde_bytes")]
     bytes: Vec<u8>,
     proof: Proof,
 }
@@ -857,5 +861,26 @@ mod tests {
             .map(|(i, s)| if i < k - 1 { Some(s.clone()) } else { None })
             .collect();
         assert!(raw::reconstruct_data(&mut received, k, m).is_err());
+    }
+
+    /// `serde_bytes` on `Shard::bytes` must not change the bincode bytes, so
+    /// that nodes with and without it agree on messages and MACs.
+    #[test]
+    fn shard_bincode_bytes_unchanged_by_serde_bytes() {
+        #[derive(Serialize)]
+        struct PlainShard<'a> {
+            bytes: &'a Vec<u8>,
+            proof: &'a Proof,
+        }
+        let hs = hash_state();
+        let shards: Vec<Vec<u8>> = (0..4u8).map(|i| vec![i; 37]).collect();
+        let (_, shards) = commit_as_dealer(&shards, &hs);
+        for shard in &shards {
+            let plain = PlainShard { bytes: &shard.bytes, proof: &shard.proof };
+            let encoded = bincode::serialize(shard).unwrap();
+            assert_eq!(encoded, bincode::serialize(&plain).unwrap());
+            let decoded: Shard = bincode::deserialize(&encoded).unwrap();
+            assert_eq!(&decoded, shard);
+        }
     }
 }
